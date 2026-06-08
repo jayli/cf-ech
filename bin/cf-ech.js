@@ -133,3 +133,88 @@ function queryDoH(domain, type = 65) {
     req.end();
   });
 }
+
+// ─── Network utilities ───
+
+function fetchJSON(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { timeout: 10000 }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+        catch (e) { reject(e); }
+      });
+    }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function testTLS(ip, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let settled = false;
+    const socket = tls.connect({
+      host: ip,
+      port: 443,
+      servername: ECH_TEST_DOMAIN,
+      timeout: timeoutMs,
+    }, () => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ success: true, elapsed: Date.now() - start });
+    });
+    socket.on('timeout', () => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ success: false, elapsed: Date.now() - start });
+    });
+    socket.on('error', () => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ success: false, elapsed: Date.now() - start });
+    });
+  });
+}
+
+async function runWithPool(tasks, concurrency) {
+  const results = [];
+  const queue = [...tasks];
+  async function worker() {
+    while (queue.length) {
+      const task = queue.shift();
+      results.push(await task());
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
+  return results;
+}
+
+async function fetchHTTPSRecord(domain) {
+  try {
+    const answers = await queryDoH(domain, 65);
+    const httpsRecords = answers.filter(a => a.type === 65);
+    if (httpsRecords.length === 0) return null;
+    const result = {};
+    for (const record of httpsRecords) {
+      const parsed = parseHTTPSRecord(record.rdata);
+      if (parsed.svcParams[4]) {
+        const buf = parsed.svcParams[4];
+        const ips = [];
+        for (let i = 0; i < buf.length; i += 4) {
+          ips.push(`${buf[i]}.${buf[i+1]}.${buf[i+2]}.${buf[i+3]}`);
+        }
+        result.ipv4hint = ips;
+      }
+      if (parsed.svcParams[5]) {
+        result.ech = parsed.svcParams[5].toString('base64');
+      }
+    }
+    if (!result.ipv4hint || result.ipv4hint.length === 0) return null;
+    return result;
+  } catch {
+    return null;
+  }
+}
