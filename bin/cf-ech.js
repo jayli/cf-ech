@@ -218,3 +218,107 @@ async function fetchHTTPSRecord(domain) {
     return null;
   }
 }
+
+// ─── Main ───
+
+async function main() {
+  const args = process.argv.slice(2);
+  const jsonMode = args.includes('-json');
+  const allMode = args.includes('-all');
+
+  // 1. Load domains
+  const localDomains = readFileSync(DOMAIN_FILE, 'utf8')
+    .trim().split('\n').map(d => d.trim()).filter(Boolean);
+  log(`本地域名: ${localDomains.length} 个`);
+
+  let onlineDomains = [];
+  try {
+    const resp = await fetchJSON(CF_TOP20_API);
+    if (resp.code === 0 && resp.data && resp.data.good) {
+      onlineDomains = resp.data.good
+        .map(item => item.ip)
+        .filter(ip => ip && /[a-z]/i.test(ip));
+    }
+    log(`在线域名: ${onlineDomains.length} 个`);
+  } catch (e) {
+    log(`在线获取失败 (${e.message})，跳过`);
+  }
+
+  const domains = [...new Set([...localDomains, ...onlineDomains])];
+  log(`合并去重: ${domains.length} 个`);
+
+  // 2. Query HTTPS records
+  log('查询 HTTPS 记录...');
+  const domainHTTPS = {};
+  let checked = 0;
+  const httpsTasks = domains.map(domain => async () => {
+    const record = await fetchHTTPSRecord(domain);
+    checked++;
+    if (checked % 50 === 0 || checked === domains.length) {
+      log(`  进度: ${checked}/${domains.length}`);
+    }
+    if (record) domainHTTPS[domain] = record;
+  });
+  await runWithPool(httpsTasks, CONCURRENCY);
+  log(`有 HTTPS 记录: ${Object.keys(domainHTTPS).length} 个`);
+
+  // 3. Build IP → domain map and test TLS
+  const ipDomains = {};
+  for (const [domain, record] of Object.entries(domainHTTPS)) {
+    for (const ip of record.ipv4hint) {
+      if (!ipDomains[ip]) ipDomains[ip] = [];
+      ipDomains[ip].push(domain);
+    }
+  }
+  const uniqueIPs = Object.keys(ipDomains);
+  log(`测试 ${uniqueIPs.length} 个 IP 的 TLS 握手...`);
+
+  const ipResult = {};
+  let tested = 0;
+  const testTasks = uniqueIPs.map(ip => async () => {
+    const result = await testTLS(ip, SCAN_TIMEOUT);
+    tested++;
+    if (tested % 20 === 0 || tested === uniqueIPs.length) {
+      log(`  进度: ${tested}/${uniqueIPs.length}`);
+    }
+    ipResult[ip] = result;
+  });
+  await runWithPool(testTasks, CONCURRENCY);
+
+  // 4. Filter ECH domains and find best IP per domain
+  const results = [];
+  for (const [domain, record] of Object.entries(domainHTTPS)) {
+    if (!record.ech) continue;
+    let bestElapsed = Infinity;
+    for (const ip of record.ipv4hint) {
+      const r = ipResult[ip];
+      if (r && r.success && r.elapsed < bestElapsed) {
+        bestElapsed = r.elapsed;
+      }
+    }
+    if (bestElapsed < Infinity) {
+      results.push({ domain, elapsed: bestElapsed });
+    }
+  }
+  results.sort((a, b) => a.elapsed - b.elapsed);
+
+  // 5. Output
+  const outputList = allMode ? results : results.slice(0, 20);
+
+  if (jsonMode) {
+    console.log(JSON.stringify(outputList, null, 2));
+  } else {
+    for (const r of outputList) {
+      console.log(`${r.domain}  ${r.elapsed}ms`);
+    }
+  }
+
+  // 6. Report (stderr)
+  log('');
+  log(`扫描域名: ${domains.length} | 支持 ECH: ${results.length} | 优选结果: ${outputList.length}`);
+}
+
+main().catch(e => {
+  process.stderr.write(`致命错误: ${e.message}\n`);
+  process.exit(1);
+});
