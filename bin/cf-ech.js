@@ -9,8 +9,11 @@ const path = require('path');
 const DOMAIN_FILE = path.join(__dirname, '..', 'data', 'domains.txt');
 const CF_TOP20_API = 'https://vps789.com/openApi/cfIpTop20';
 const CF_IPS_URL = 'https://api.cloudflare.com/client/v4/ips';
-const ECH_TEST_DOMAIN = 'c.consolelog.work';
-const DOH_SERVER = 'https://dns.alidns.com/dns-query';
+const ECH_TEST_DOMAIN = 'cloudflare.com';
+const DOH_SERVERS = [
+  'https://dns.alidns.com/dns-query',
+  'https://cloudflare-dns.com/dns-query',
+];
 const CONCURRENCY = 50;
 const SCAN_TIMEOUT = 5000;
 
@@ -104,10 +107,9 @@ function parseHTTPSRecord(rdata) {
   return { priority, svcParams };
 }
 
-function queryDoH(domain, type = 65) {
+function queryDoHSingle(server, query) {
   return new Promise((resolve, reject) => {
-    const query = buildDnsQuery(domain, type);
-    const url = new URL(DOH_SERVER);
+    const url = new URL(server);
     const options = {
       hostname: url.hostname,
       port: 443,
@@ -133,6 +135,16 @@ function queryDoH(domain, type = 65) {
     req.write(query);
     req.end();
   });
+}
+
+async function queryDoH(domain, type = 65) {
+  const query = buildDnsQuery(domain, type);
+  for (const server of DOH_SERVERS) {
+    try {
+      return await queryDoHSingle(server, query);
+    } catch {}
+  }
+  throw new Error('所有 DoH 服务器查询失败');
 }
 
 // ─── Network utilities ───
