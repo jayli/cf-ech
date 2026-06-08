@@ -338,6 +338,26 @@ async function main() {
     return checkDomain(domain);
   }
 
+  const g = '\x1b[32m';  // green
+  const w = '\x1b[37m';  // white
+  const y = '\x1b[33m';  // yellow
+  const d = '\x1b[90m';  // dim/gray
+  const r = '\x1b[0m';   // reset
+  const banner = [
+    `${g}(             )${r}`,
+    `${g} \`--(_   _)--'${r}`,
+    `${g}      Y-Y${r}`,
+    `${w}     /${y}@@${w} \\${r}`,
+    `${w}    /     \\${r}`,
+    `${w}    \`--'.  \\             ,${r}`,
+    `${w}        |   \`.__________/)${r}`,
+    `${w} CF-ECH${r}`,
+    `${d}------------------------------------------------${r}`,
+  ].join('\n');
+  log(banner);
+  log('正在扫描出 支持 ECH 的 CF 域名列表...');
+  log('');
+
   // 1. Load domains
   const localDomains = readFileSync(DOMAIN_FILE, 'utf8')
     .trim().split('\n').map(d => d.trim()).filter(Boolean);

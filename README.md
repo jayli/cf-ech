@@ -1,5 +1,7 @@
 ## cf-ech
 
+<a href="https://nodei.co/npm/cf-ech/"><img src="https://nodei.co/npm/cf-ech.svg?style=mini"></a>
+
 > Find the fastest cf CDN domains that support ech.
 
 寻找支持 ECH 的 Cloudflare 优选域名。
