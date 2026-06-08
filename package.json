@@ -1,6 +1,6 @@
 {
   "name": "cf-ech",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Find the fastest Cloudflare CDN domains that support ECH",
   "bin": {
     "cf-ech": "./bin/cf-ech.js"
