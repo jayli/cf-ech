@@ -8,6 +8,7 @@ const path = require('path');
 
 const DOMAIN_FILE = path.join(__dirname, '..', 'data', 'domains.txt');
 const CF_TOP20_API = 'https://vps789.com/openApi/cfIpTop20';
+const CF_IPS_URL = 'https://api.cloudflare.com/client/v4/ips';
 const ECH_TEST_DOMAIN = 'c.consolelog.work';
 const DOH_SERVER = 'https://dns.alidns.com/dns-query';
 const CONCURRENCY = 50;
@@ -149,6 +150,30 @@ function fetchJSON(url) {
   });
 }
 
+function ipToNum(ip) {
+  return ip.split('.').reduce((n, o) => (n << 8) + parseInt(o), 0) >>> 0;
+}
+
+function ipInCIDR(ip, cidr) {
+  const [base, bits] = cidr.split('/');
+  const mask = ~((1 << (32 - parseInt(bits))) - 1) >>> 0;
+  return (ipToNum(ip) & mask) === (ipToNum(base) & mask);
+}
+
+function ipInCIDRList(ip, cidrs) {
+  return cidrs.some(cidr => ipInCIDR(ip, cidr));
+}
+
+async function fetchCFIPv4CIDRs() {
+  try {
+    const data = await fetchJSON(CF_IPS_URL);
+    if (data.success && data.result && data.result.ipv4_cidrs) {
+      return data.result.ipv4_cidrs;
+    }
+  } catch {}
+  return null;
+}
+
 function testTLS(ip, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -221,10 +246,85 @@ async function fetchHTTPSRecord(domain) {
 
 // ─── Main ───
 
+async function checkDomain(domain) {
+  log(`检测域名: ${domain}`);
+  const record = await fetchHTTPSRecord(domain);
+  if (!record) {
+    log('结果: 无 HTTPS 记录（非 CF 优选域名或无 ipv4hint）');
+    process.exit(1);
+  }
+  log(`ipv4hint: ${record.ipv4hint.join(', ')}`);
+
+  // 验证 IP 是否属于 CF
+  log('验证 IP 是否属于 Cloudflare...');
+  const cfCIDRs = await fetchCFIPv4CIDRs();
+  if (cfCIDRs) {
+    const cfIPs = record.ipv4hint.filter(ip => ipInCIDRList(ip, cfCIDRs));
+    if (cfIPs.length === 0) {
+      log('结果: IP 不属于 Cloudflare IP 段，非 CF 域名');
+      process.exit(1);
+    }
+    log(`CF IP: ${cfIPs.join(', ')}`);
+  } else {
+    log('警告: 无法获取 CF IP 段列表，跳过验证');
+  }
+
+  if (!record.ech) {
+    log('结果: 是 CF 域名但不支持 ECH');
+    process.exit(1);
+  }
+  log('ECH: 支持');
+  let bestIP = null;
+  let bestElapsed = Infinity;
+  for (const ip of record.ipv4hint) {
+    const r = await testTLS(ip, SCAN_TIMEOUT);
+    if (r.success && r.elapsed < bestElapsed) {
+      bestElapsed = r.elapsed;
+      bestIP = ip;
+    }
+  }
+  if (!bestIP) {
+    log('结果: 支持 ECH 但 TLS 握手全部超时');
+    process.exit(1);
+  }
+  log(`TLS 握手: ${bestElapsed}ms (${bestIP})`);
+  log('');
+  log(`✓ ${domain} 是支持 ECH 的 CF 优选域名`);
+  console.log(`${domain}  ${bestElapsed}ms`);
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const jsonMode = args.includes('-json');
   const allMode = args.includes('-all');
+
+  if (args.includes('--version') || args.includes('-v')) {
+    const pkg = JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    console.log(pkg.version);
+    return;
+  }
+
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(`cf-ech - 发现支持 ECH 的 Cloudflare 优选域名
+
+用法:
+  cf-ech              扫描并输出前 20 个支持 ECH 的优选域名
+  cf-ech -all         输出所有支持 ECH 的域名
+  cf-ech -json        以 JSON 格式输出
+  cf-ech -c <domain>  检测指定域名是否为支持 ECH 的 CF 优选域名
+  cf-ech --help       显示帮助信息`);
+    return;
+  }
+
+  const cIdx = args.indexOf('-c');
+  if (cIdx !== -1) {
+    const domain = args[cIdx + 1];
+    if (!domain) {
+      process.stderr.write('用法: cf-ech -c <domain>\n');
+      process.exit(1);
+    }
+    return checkDomain(domain);
+  }
 
   // 1. Load domains
   const localDomains = readFileSync(DOMAIN_FILE, 'utf8')
