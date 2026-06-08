@@ -301,7 +301,7 @@ async function checkDomain(domain) {
   }
   log(`TLS 握手: ${bestElapsed}ms (${bestIP})`);
   log('');
-  log(`✓ ${domain} 是支持 ECH 的 CF 优选域名`);
+  log(`✓ ${domain} 是支持 ECH 的指向 CF CDN 节点的域名`);
   console.log(`${domain}  ${bestElapsed}ms`);
 }
 
@@ -317,7 +317,7 @@ async function main() {
   }
 
   if (args.includes('--help') || args.includes('-h')) {
-    console.log(`cf-ech - 发现支持 ECH 的 Cloudflare 优选域名
+    console.log(`cf-ech - 发现支持 ECH 的指向 Cloudflare CDN 的优选域名
 
 用法:
   cf-ech              扫描并输出前 20 个支持 ECH 的优选域名
