@@ -27,3 +27,10 @@ npx cf-ech
 
 **How** — 通过 DoH 查询域名的 [HTTPS 记录（type 65）](https://datatracker.ietf.org/doc/html/rfc9460)，从中提取 `ipv4hint`（CDN 节点 IP）和 `ech`（ECH 配置）。筛选出同时具备两者的域名，对其 IP 做 TLS 握手测速。
 
+
+### 怎么用
+
+以 xray 为例：
+
+- ech 配置：cloudflare-ech.com+https://996icu.cloudflare-gateway.com/dns-query
+- 优选域名：填入 cf-ech 跑出来的域名
