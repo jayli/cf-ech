@@ -19,6 +19,55 @@ const SCAN_TIMEOUT = 5000;
 
 function log(msg) { process.stderr.write(msg + '\n'); }
 
+function buildDomainScore(domain, ips, ipResults) {
+  let totalSuccess = 0;
+  const latencies = [];
+  for (const ip of ips) {
+    const r = ipResults[ip];
+    if (r && r.success) {
+      totalSuccess += r.successCount;
+      latencies.push(r.elapsed);
+    }
+  }
+
+  const totalTests = ips.length * 2;
+  const successRate = totalTests > 0 ? totalSuccess / totalTests : 0;
+  if (successRate < 1 || ips.length < 2) return null;
+
+  const avgLatency = Math.round(latencies.reduce((sum, ms) => sum + ms, 0) / latencies.length);
+  const minLatency = Math.min(...latencies);
+  const maxLatency = Math.max(...latencies);
+  const spread = maxLatency - minLatency;
+  const ipCount = ips.length;
+  const ipPenalty = Math.max(0, ipCount - 3);
+
+  const latencyScore = Math.max(0, 500 - avgLatency) / 500;
+  const stabilityScore = Math.max(0, 250 - spread) / 250;
+  const ipCountScore = Math.max(0, 7 - ipPenalty) / 7;
+  const score = latencyScore * 70 + stabilityScore * 20 + ipCountScore * 10;
+
+  let bestIP = ips[0];
+  let bestLatency = Infinity;
+  for (const ip of ips) {
+    const r = ipResults[ip];
+    if (r && r.success && r.elapsed < bestLatency) {
+      bestLatency = r.elapsed;
+      bestIP = ip;
+    }
+  }
+
+  return {
+    domain,
+    ip: bestIP,
+    elapsed: bestLatency,
+    score: Math.round(score * 100) / 100,
+    ipCount,
+    avgLatency,
+    spread,
+    ipPenalty,
+  };
+}
+
 // ─── DNS wire-format encoding ───
 
 function encodeDnsName(domain) {
@@ -641,54 +690,17 @@ async function main() {
   // 7. Filter 100% success domains, then score
   const domainScores = [];
   for (const [domain, ips] of Object.entries(domainCFIPs)) {
-    let totalSuccess = 0;
-    let totalLatency = 0;
-    let successIPCount = 0;
-    for (const ip of ips) {
-      const r = ipResults[ip];
-      if (r && r.success) {
-        totalSuccess += r.successCount;
-        totalLatency += r.elapsed;
-        successIPCount++;
-      }
-    }
-    const totalTests = ips.length * 2;
-    const successRate = totalTests > 0 ? totalSuccess / totalTests : 0;
-    // Hard filter: only domains where every test succeeded
-    if (successRate < 1) continue;
-
-    const avgLatency = successIPCount > 0 ? Math.round(totalLatency / successIPCount) : 999;
-    const ipCount = ips.length;
-
-    // Score for ranking: dispersion 40%, latency 60% (all domains here are 100% reliable)
-    // Cap dispersion at 10 IPs
-    const dispersionScore = Math.min(ipCount, 10) / 10;
-    const latencyScore = Math.max(0, 500 - avgLatency) / 500;
-    const score = dispersionScore * 40 + latencyScore * 60;
-
-    // Best IP for output
-    let bestIP = ips[0];
-    let bestLatency = Infinity;
-    for (const ip of ips) {
-      const r = ipResults[ip];
-      if (r && r.success && r.elapsed < bestLatency) {
-        bestLatency = r.elapsed;
-        bestIP = ip;
-      }
-    }
-    if (bestLatency === Infinity) bestLatency = 999;
-
-    domainScores.push({
-      domain,
-      ip: bestIP,
-      elapsed: bestLatency,
-      score: Math.round(score * 100) / 100,
-      ipCount,
-    });
+    const domainScore = buildDomainScore(domain, ips, ipResults);
+    if (domainScore) domainScores.push(domainScore);
   }
 
-  // Sort by score descending, then by latency ascending as tiebreaker
-  domainScores.sort((a, b) => b.score - a.score || a.elapsed - b.elapsed);
+  // Sort by score descending, then prefer lower average latency, lower spread, and fastest IP.
+  domainScores.sort((a, b) =>
+    b.score - a.score ||
+    a.avgLatency - b.avgLatency ||
+    a.spread - b.spread ||
+    a.elapsed - b.elapsed
+  );
 
   log('');
 
@@ -707,12 +719,18 @@ async function main() {
   // 9. Report (stderr)
   log('');
   log(`扫描域名: ${domains.length} | CF 域名: ${Object.keys(domainCFIPs).length} | 100%成功率: ${domainScores.length} | 优选结果: ${outputList.length}`);
-  log(`硬性要求: 所有 IP 的 TLS 握手成功率必须 100%`);
-  log(`评分维度: IP分散度(40%) + 低延迟(60%)`);
+  log(`硬性要求: 所有 IP 的 TLS 握手成功率必须 100%，且至少 2 个 IP`);
+  log(`评分维度: 平均延迟(70%) + IP间稳定性(20%) + IP数<=3奖励(10%)`);
   log(`ECH: ${echConfig ? '已启用' : '未启用(普通TLS)'}`);
 }
 
-main().catch(e => {
-  process.stderr.write(`致命错误: ${e.message}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(e => {
+    process.stderr.write(`致命错误: ${e.message}\n`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  buildDomainScore,
+};
