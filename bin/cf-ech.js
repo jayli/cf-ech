@@ -402,7 +402,7 @@ async function checkDomain(domain) {
 
   // Score assessment
   if (overallRate >= 90) {
-    log('评价: 连接质量优秀，适合作为代理外层 SNI');
+    log('评价: 连接质量优秀，适合作为优选 CF 接入点');
   } else if (overallRate >= 70) {
     log('评价: 连接质量良好，可以使用');
   } else if (overallRate >= 50) {
