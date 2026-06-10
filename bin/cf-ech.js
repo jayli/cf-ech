@@ -16,6 +16,7 @@ const DOH_SERVERS = [
 ];
 const CONCURRENCY = 50;
 const SCAN_TIMEOUT = 5000;
+const MAX_RECOMMENDED_LATENCY = 800; // ms — 优选节点的平均延迟上限
 
 function log(msg) { process.stderr.write(msg + '\n'); }
 
@@ -358,26 +359,17 @@ async function runWithPool(tasks, concurrency) {
 // ─── Single domain check (-c) ───
 
 async function checkDomain(domain) {
-  log(`检测域名: ${domain}`);
-
   // 1. Get ECH config from cloudflare-ech.com (same as Xray)
   const echConfig = await fetchECHConfig();
-  if (!echConfig) {
-    log('警告: 无法获取 ECH 公钥配置 (cloudflare-ech.com)，将使用普通 TLS');
-  } else {
-    log('ECH 公钥: 已获取 (来自 cloudflare-ech.com)');
-  }
 
-  // 2. DNS resolve — multiple queries to collect full IP pool
+  // 2. DNS resolve
   const allIPs = await resolveARecords(domain);
   if (allIPs.length === 0) {
     log('结果: 无 A 记录，无法检测');
     process.exit(1);
   }
-  log(`解析到 ${allIPs.length} 个 IP: ${allIPs.join(', ')}`);
 
   // 3. Verify IPs belong to Cloudflare
-  log('验证 IP 是否属于 Cloudflare...');
   const cfCIDRs = await fetchCFIPv4CIDRs();
   let cfIPs = allIPs;
   if (cfCIDRs) {
@@ -386,18 +378,25 @@ async function checkDomain(domain) {
       log('结果: IP 不属于 Cloudflare IP 段，非 CF 域名');
       process.exit(1);
     }
+  }
+
+  // Header
+  log(`检测域名: ${domain}`);
+  log(`ECH 配置: ${echConfig ? '✓ 已获取' : '✗ 未获取，将使用普通 TLS'}`);
+  log(`解析 IP:  ${allIPs.length} 个 (${allIPs.join(', ')})`);
+  if (cfCIDRs) {
     if (cfIPs.length < allIPs.length) {
-      log(`CF IP (${cfIPs.length} 个): ${cfIPs.join(', ')}`);
-      log(`非 CF IP (已排除): ${allIPs.filter(ip => !cfIPs.includes(ip)).join(', ')}`);
+      log(`CF 验证:  ✓ ${cfIPs.length}/${allIPs.length} 个 IP 属 CF 段 (排除: ${allIPs.filter(ip => !cfIPs.includes(ip)).join(', ')})`);
     } else {
-      log(`全部 ${cfIPs.length} 个 IP 均属 CF 段`);
+      log(`CF 验证:  ✓ 全部 ${cfIPs.length} 个 IP 均属 CF 段`);
     }
   } else {
-    log('警告: 无法获取 CF IP 段列表，跳过验证');
+    log('CF 验证:  ⚠ 无法获取 CF IP 段，跳过验证');
   }
 
   // 4. ECH TLS handshake test — 5 rounds per IP
-  log(`开始 ECH TLS 实测 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
+  log('');
+  log(`测速 (ECH TLS, 每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)`);
   const results = [];
   let tested = 0;
   for (const ip of cfIPs) {
@@ -421,34 +420,45 @@ async function checkDomain(domain) {
     }
   }
 
-  // 5. Output
+  // 5. Output results
   log('');
   const maxIPLen = Math.max(...results.map(r => r.ip.length));
-  for (const r of results) {
+  // Sort: successful IPs by avg latency ascending, failed IPs at bottom
+  const sorted = [...results].sort((a, b) => {
+    if (a.avg == null && b.avg == null) return 0;
+    if (a.avg == null) return 1;
+    if (b.avg == null) return -1;
+    return a.avg - b.avg;
+  });
+  for (const r of sorted) {
     const ratePct = Math.round(r.successRate * 100);
     if (r.successes > 0) {
       const jitter = r.max - r.min;
-      console.log(`${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)`);
+      console.log(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)`);
     } else {
-      console.log(`${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  全部失败`);
+      console.log(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  全部超时`);
     }
   }
 
+  // 6. Summary + evaluation
   const totalSuccess = results.reduce((s, r) => s + r.successes, 0);
   const totalTests = results.length * 5;
   const overallRate = Math.round(totalSuccess / totalTests * 100);
+  const successResults = results.filter(r => r.avg != null);
+  const avgLatency = successResults.length > 0
+    ? Math.round(successResults.reduce((s, r) => s + r.avg, 0) / successResults.length)
+    : Infinity;
   log('');
-  log(`总计: ${cfIPs.length} 个 IP | ${totalTests} 次握手 | 成功 ${totalSuccess} 次 (${overallRate}%) | ECH: ${echConfig ? '已启用' : '未启用(普通TLS)'}`);
+  log(`总计: ${cfIPs.length} 个 IP | ${totalTests} 次握手 | 成功 ${totalSuccess} 次 (${overallRate}%) | ECH: ${echConfig ? '已启用' : '未启用'}`);
 
-  // Score assessment
-  if (overallRate >= 90) {
-    log('评价: 连接质量优秀，适合作为优选 CF 接入点');
+  if (overallRate === 100 && avgLatency < MAX_RECOMMENDED_LATENCY) {
+    log('评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点');
+  } else if (overallRate >= 90) {
+    log('评价: 连接质量良好，可作为普通 CF 节点接入');
   } else if (overallRate >= 70) {
-    log('评价: 连接质量良好，可以使用');
-  } else if (overallRate >= 50) {
-    log('评价: 连接质量一般，高峰期可能不稳定');
+    log('评价: 连接质量一般，可作为普通 CF 节点接入');
   } else if (overallRate > 0) {
-    log('评价: 连接质量差，不推荐使用');
+    log('评价: 连接不稳定，不推荐');
   } else {
     log('评价: 无法连接，不可用');
   }
@@ -457,26 +467,17 @@ async function checkDomain(domain) {
 // ─── Speed test (-t) ───
 
 async function testDomain(domain) {
-  log(`测速域名: ${domain}`);
-
-  // Get ECH config
+  // 1. Get ECH config
   const echConfig = await fetchECHConfig();
-  if (echConfig) {
-    log('ECH 公钥: 已获取 (来自 cloudflare-ech.com)');
-  } else {
-    log('警告: 无法获取 ECH 公钥');
-  }
 
-  // Resolve A records
+  // 2. DNS resolve
   const aIPs = await resolveARecords(domain);
   if (aIPs.length === 0) {
     log('结果: 无 A 记录');
     process.exit(1);
   }
-  log(`解析到 ${aIPs.length} 个 IP: ${aIPs.join(', ')}`);
 
-  // Verify CF IPs
-  log('验证 IP 是否属于 Cloudflare...');
+  // 3. Verify CF IPs
   const cfCIDRs = await fetchCFIPv4CIDRs();
   let cfIPs = aIPs;
   if (cfCIDRs) {
@@ -485,21 +486,46 @@ async function testDomain(domain) {
       log('结果: IP 不属于 Cloudflare IP 段，非 CF 域名');
       process.exit(1);
     }
+  }
+
+  // Header
+  log(`检测域名: ${domain}`);
+  log(`ECH 配置: ${echConfig ? '✓ 已获取' : '✗ 未获取，将使用普通 TLS'}`);
+  log(`解析 IP:  ${aIPs.length} 个 (${aIPs.join(', ')})`);
+  if (cfCIDRs) {
     if (cfIPs.length < aIPs.length) {
-      log(`CF IP (${cfIPs.length} 个): ${cfIPs.join(', ')}`);
-      log(`非 CF IP (已排除): ${aIPs.filter(ip => !cfIPs.includes(ip)).join(', ')}`);
+      log(`CF 验证:  ✓ ${cfIPs.length}/${aIPs.length} 个 IP 属 CF 段 (排除: ${aIPs.filter(ip => !cfIPs.includes(ip)).join(', ')})`);
     } else {
-      log(`全部 ${cfIPs.length} 个 IP 均属 CF 段`);
+      log(`CF 验证:  ✓ 全部 ${cfIPs.length} 个 IP 均属 CF 段`);
     }
   } else {
-    log('警告: 无法获取 CF IP 段列表，跳过验证');
+    log('CF 验证:  ⚠ 无法获取 CF IP 段，跳过验证');
   }
 
   const maxIPLen = Math.max(...cfIPs.map(ip => ip.length));
 
-  // --- ECH 握手测速 (5 rounds) ---
-  log('────────────────────────────────────────');
-  log(`ECH 握手测速 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
+  // Helper: print results sorted by latency ascending, failed IPs at bottom
+  function printResults(results) {
+    const sorted = [...results].sort((a, b) => {
+      if (a.avg == null && b.avg == null) return 0;
+      if (a.avg == null) return 1;
+      if (b.avg == null) return -1;
+      return a.avg - b.avg;
+    });
+    for (const r of sorted) {
+      const ratePct = Math.round(r.successRate * 100);
+      if (r.successes > 0) {
+        const jitter = r.max - r.min;
+        console.log(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)`);
+      } else {
+        console.log(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  全部超时`);
+      }
+    }
+  }
+
+  // --- ECH TLS 测速 (5 rounds) ---
+  log('');
+  log(`测速 (ECH TLS, 每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)`);
   const echResults = [];
   let tested = 0;
   for (const ip of cfIPs) {
@@ -515,26 +541,18 @@ async function testDomain(domain) {
     if (latencies.length > 0) {
       const sorted = [...latencies].sort((a, b) => a - b);
       const avg = Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length);
-      echResults.push({ ip, successRate: latencies.length / 5, avg, min: sorted[0], max: sorted[sorted.length - 1] });
+      echResults.push({ ip, successRate: latencies.length / 5, avg, min: sorted[0], max: sorted[sorted.length - 1], successes: latencies.length });
     } else {
-      echResults.push({ ip, successRate: 0, avg: null, min: null, max: null });
+      echResults.push({ ip, successRate: 0, avg: null, min: null, max: null, successes: 0 });
     }
   }
 
   log('');
-  const echSuccess = echResults.filter(r => r.avg != null).sort((a, b) => a.avg - b.avg);
-  for (const r of echSuccess) {
-    const rate = Math.round(r.successRate * 100);
-    const jitter = r.max - r.min;
-    console.log(`${r.ip.padEnd(maxIPLen + 2)}${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)  成功率: ${rate}%`);
-  }
-  if (echSuccess.length === 0) log('所有 IP 均 ECH 握手失败');
+  printResults(echResults);
 
-  log(`ECH: ${echConfig ? '已启用' : '未启用(普通TLS)'}`);
-
-  // --- 无 ECH 握手连接速度 (5 rounds) ---
-  log('────────────────────────────────────────');
-  log(`无 ECH 握手连接速度 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
+  // --- 普通 TLS 测速 (5 rounds) ---
+  log('');
+  log(`测速 (普通 TLS, 每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)`);
   const tlsResults = [];
   tested = 0;
   for (const ip of cfIPs) {
@@ -548,22 +566,45 @@ async function testDomain(domain) {
     if (latencies.length > 0) {
       const sorted = [...latencies].sort((a, b) => a - b);
       const avg = Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length);
-      tlsResults.push({ ip, successRate: latencies.length / 5, avg, min: sorted[0], max: sorted[sorted.length - 1] });
+      tlsResults.push({ ip, successRate: latencies.length / 5, avg, min: sorted[0], max: sorted[sorted.length - 1], successes: latencies.length });
     } else {
-      tlsResults.push({ ip, successRate: 0, avg: null, min: null, max: null });
+      tlsResults.push({ ip, successRate: 0, avg: null, min: null, max: null, successes: 0 });
     }
   }
 
   log('');
-  const tlsSuccess = tlsResults.filter(r => r.avg != null).sort((a, b) => a.avg - b.avg);
-  for (const r of tlsSuccess) {
-    const rate = Math.round(r.successRate * 100);
-    const jitter = r.max - r.min;
-    console.log(`${r.ip.padEnd(maxIPLen + 2)}${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)  成功率: ${rate}%`);
-  }
-  if (tlsSuccess.length === 0) log('所有 IP 均握手失败');
-  log('────────────────────────────────────────');
+  printResults(tlsResults);
 
+  // Summary + evaluation
+  const echTotal = echResults.reduce((s, r) => s + r.successes, 0);
+  const tlsTotal = tlsResults.reduce((s, r) => s + r.successes, 0);
+  const totalPerMode = cfIPs.length * 5;
+  const echRate = Math.round(echTotal / totalPerMode * 100);
+  const tlsRate = Math.round(tlsTotal / totalPerMode * 100);
+
+  const echSuccess = echResults.filter(r => r.avg != null);
+  const tlsSuccess = tlsResults.filter(r => r.avg != null);
+  const echAvgLatency = echSuccess.length > 0
+    ? Math.round(echSuccess.reduce((s, r) => s + r.avg, 0) / echSuccess.length)
+    : Infinity;
+  const tlsAvgLatency = tlsSuccess.length > 0
+    ? Math.round(tlsSuccess.reduce((s, r) => s + r.avg, 0) / tlsSuccess.length)
+    : Infinity;
+
+  log('');
+  log(`总计: ${cfIPs.length} 个 IP | ECH 成功 ${echTotal} 次 (${echRate}%) | 普通 成功 ${tlsTotal} 次 (${tlsRate}%)`);
+
+  if (echRate === 100 && echAvgLatency < MAX_RECOMMENDED_LATENCY) {
+    log('评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点');
+  } else if (tlsRate === 100 && tlsAvgLatency < MAX_RECOMMENDED_LATENCY) {
+    log('评价: 连接质量良好，可作为普通 CF 节点接入');
+  } else if (echRate >= 70 || tlsRate >= 70) {
+    log('评价: 连接质量一般，高峰期可能不稳定');
+  } else if (echRate > 0 || tlsRate > 0) {
+    log('评价: 连接质量差，不推荐');
+  } else {
+    log('评价: 无法连接，不可用');
+  }
 }
 
 // ─── Main ───
