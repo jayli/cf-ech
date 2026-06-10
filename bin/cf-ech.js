@@ -17,6 +17,7 @@ const DOH_SERVERS = [
 const CONCURRENCY = 50;
 const SCAN_TIMEOUT = 5000;
 const MAX_RECOMMENDED_LATENCY = 800; // ms — 优选节点的平均延迟上限
+const MAX_RECOMMENDED_JITTER = 1000; // ms — 优选节点的单 IP 抖动上限
 
 function log(msg) { process.stderr.write(msg + '\n'); }
 
@@ -451,7 +452,11 @@ async function checkDomain(domain) {
   log('');
   log(`总计: ${cfIPs.length} 个 IP | ${totalTests} 次握手 | 成功 ${totalSuccess} 次 (${overallRate}%) | ECH: ${echConfig ? '已启用' : '未启用'}`);
 
-  if (overallRate === 100 && avgLatency < MAX_RECOMMENDED_LATENCY) {
+  const maxJitter = successResults.length > 0
+    ? Math.max(...successResults.map(r => r.max - r.min))
+    : 0;
+
+  if (overallRate === 100 && avgLatency < MAX_RECOMMENDED_LATENCY && maxJitter <= MAX_RECOMMENDED_JITTER) {
     log('评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点');
   } else if (overallRate >= 90) {
     log('评价: 连接质量良好，可作为普通 CF 节点接入');
@@ -591,12 +596,19 @@ async function testDomain(domain) {
     ? Math.round(tlsSuccess.reduce((s, r) => s + r.avg, 0) / tlsSuccess.length)
     : Infinity;
 
+  const echMaxJitter = echSuccess.length > 0
+    ? Math.max(...echSuccess.map(r => r.max - r.min))
+    : 0;
+  const tlsMaxJitter = tlsSuccess.length > 0
+    ? Math.max(...tlsSuccess.map(r => r.max - r.min))
+    : 0;
+
   log('');
   log(`总计: ${cfIPs.length} 个 IP | ECH 成功 ${echTotal} 次 (${echRate}%) | 普通 成功 ${tlsTotal} 次 (${tlsRate}%)`);
 
-  if (echRate === 100 && echAvgLatency < MAX_RECOMMENDED_LATENCY) {
+  if (echRate === 100 && echAvgLatency < MAX_RECOMMENDED_LATENCY && echMaxJitter <= MAX_RECOMMENDED_JITTER) {
     log('评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点');
-  } else if (tlsRate === 100 && tlsAvgLatency < MAX_RECOMMENDED_LATENCY) {
+  } else if (tlsRate === 100 && tlsAvgLatency < MAX_RECOMMENDED_LATENCY && tlsMaxJitter <= MAX_RECOMMENDED_JITTER) {
     log('评价: 连接质量良好，可作为普通 CF 节点接入');
   } else if (echRate >= 70 || tlsRate >= 70) {
     log('评价: 连接质量一般，高峰期可能不稳定');
