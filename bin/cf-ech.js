@@ -235,15 +235,6 @@ async function resolveARecords(domain) {
   }
 }
 
-async function resolveAllIPs(domain, queries = 1) {
-  const ipSet = new Set();
-  for (let i = 0; i < queries; i++) {
-    const ips = await resolveARecords(domain);
-    for (const ip of ips) ipSet.add(ip);
-  }
-  return [...ipSet];
-}
-
 // ─── Network utilities ───
 
 function fetchJSON(url) {
@@ -378,7 +369,7 @@ async function checkDomain(domain) {
   }
 
   // 2. DNS resolve — multiple queries to collect full IP pool
-  const allIPs = await resolveAllIPs(domain, 3);
+  const allIPs = await resolveARecords(domain);
   if (allIPs.length === 0) {
     log('结果: 无 A 记录，无法检测');
     process.exit(1);
@@ -406,7 +397,7 @@ async function checkDomain(domain) {
   }
 
   // 4. ECH TLS handshake test — 5 rounds per IP
-  log(`开始 ECH TLS 实测 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT}ms)...`);
+  log(`开始 ECH TLS 实测 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
   const results = [];
   let tested = 0;
   for (const ip of cfIPs) {
@@ -473,7 +464,7 @@ async function testDomain(domain) {
   if (echConfig) {
     log('ECH 公钥: 已获取 (来自 cloudflare-ech.com)');
   } else {
-    log('警告: 无法获取 ECH 公钥，使用普通 TLS 测速');
+    log('警告: 无法获取 ECH 公钥');
   }
 
   // Resolve A records
@@ -483,38 +474,96 @@ async function testDomain(domain) {
     process.exit(1);
   }
   log(`解析到 ${aIPs.length} 个 IP: ${aIPs.join(', ')}`);
-  log('');
 
-  const results = [];
+  // Verify CF IPs
+  log('验证 IP 是否属于 Cloudflare...');
+  const cfCIDRs = await fetchCFIPv4CIDRs();
+  let cfIPs = aIPs;
+  if (cfCIDRs) {
+    cfIPs = aIPs.filter(ip => ipInCIDRList(ip, cfCIDRs));
+    if (cfIPs.length === 0) {
+      log('结果: IP 不属于 Cloudflare IP 段，非 CF 域名');
+      process.exit(1);
+    }
+    if (cfIPs.length < aIPs.length) {
+      log(`CF IP (${cfIPs.length} 个): ${cfIPs.join(', ')}`);
+      log(`非 CF IP (已排除): ${aIPs.filter(ip => !cfIPs.includes(ip)).join(', ')}`);
+    } else {
+      log(`全部 ${cfIPs.length} 个 IP 均属 CF 段`);
+    }
+  } else {
+    log('警告: 无法获取 CF IP 段列表，跳过验证');
+  }
+
+  const maxIPLen = Math.max(...cfIPs.map(ip => ip.length));
+
+  // --- ECH 握手测速 (5 rounds) ---
+  log('────────────────────────────────────────');
+  log(`ECH 握手测速 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
+  const echResults = [];
   let tested = 0;
-  for (const ip of aIPs) {
-    const r1 = echConfig
-      ? await testECHTLS(ip, SCAN_TIMEOUT, domain, echConfig)
-      : await testTLS(ip, SCAN_TIMEOUT, domain);
-    const r2 = echConfig
-      ? await testECHTLS(ip, SCAN_TIMEOUT, domain, echConfig)
-      : await testTLS(ip, SCAN_TIMEOUT, domain);
+  for (const ip of cfIPs) {
+    const latencies = [];
+    for (let i = 0; i < 5; i++) {
+      const r = echConfig
+        ? await testECHTLS(ip, SCAN_TIMEOUT, domain, echConfig)
+        : await testTLS(ip, SCAN_TIMEOUT, domain);
+      if (r.success) latencies.push(r.elapsed);
+    }
     tested++;
-    log(`  进度: ${tested}/${aIPs.length}`);
-    if (r1.success && r2.success) {
-      results.push({ ip, elapsed: Math.round((r1.elapsed + r2.elapsed) / 2) });
+    log(`  进度: ${tested}/${cfIPs.length}`);
+    if (latencies.length > 0) {
+      const sorted = [...latencies].sort((a, b) => a - b);
+      const avg = Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length);
+      echResults.push({ ip, successRate: latencies.length / 5, avg, min: sorted[0], max: sorted[sorted.length - 1] });
+    } else {
+      echResults.push({ ip, successRate: 0, avg: null, min: null, max: null });
     }
   }
 
-  if (results.length === 0) {
-    log('结果: 所有 IP TLS 握手均失败');
-    process.exit(1);
+  log('');
+  const echSuccess = echResults.filter(r => r.avg != null).sort((a, b) => a.avg - b.avg);
+  for (const r of echSuccess) {
+    const rate = Math.round(r.successRate * 100);
+    const jitter = r.max - r.min;
+    console.log(`${r.ip.padEnd(maxIPLen + 2)}${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)  成功率: ${rate}%`);
+  }
+  if (echSuccess.length === 0) log('所有 IP 均 ECH 握手失败');
+
+  log(`ECH: ${echConfig ? '已启用' : '未启用(普通TLS)'}`);
+
+  // --- 无 ECH 握手连接速度 (5 rounds) ---
+  log('────────────────────────────────────────');
+  log(`无 ECH 握手连接速度 (每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
+  const tlsResults = [];
+  tested = 0;
+  for (const ip of cfIPs) {
+    const latencies = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await testTLS(ip, SCAN_TIMEOUT, domain);
+      if (r.success) latencies.push(r.elapsed);
+    }
+    tested++;
+    log(`  进度: ${tested}/${cfIPs.length}`);
+    if (latencies.length > 0) {
+      const sorted = [...latencies].sort((a, b) => a - b);
+      const avg = Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length);
+      tlsResults.push({ ip, successRate: latencies.length / 5, avg, min: sorted[0], max: sorted[sorted.length - 1] });
+    } else {
+      tlsResults.push({ ip, successRate: 0, avg: null, min: null, max: null });
+    }
   }
 
-  results.sort((a, b) => a.elapsed - b.elapsed);
   log('');
-  const maxIPLen = Math.max(...results.map(r => r.ip.length));
-  for (const r of results) {
-    console.log(`${r.ip.padEnd(maxIPLen + 2)}${r.elapsed}ms`);
+  const tlsSuccess = tlsResults.filter(r => r.avg != null).sort((a, b) => a.avg - b.avg);
+  for (const r of tlsSuccess) {
+    const rate = Math.round(r.successRate * 100);
+    const jitter = r.max - r.min;
+    console.log(`${r.ip.padEnd(maxIPLen + 2)}${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)  成功率: ${rate}%`);
   }
-  log('');
-  log(`最佳: ${results[0].ip}  ${results[0].elapsed}ms`);
-  log(`ECH: ${echConfig ? '已启用' : '未启用(普通TLS)'}`);
+  if (tlsSuccess.length === 0) log('所有 IP 均握手失败');
+  log('────────────────────────────────────────');
+
 }
 
 // ─── Main ───
@@ -538,7 +587,7 @@ async function main() {
   cf-ech -all         输出所有实测通过的域名
   cf-ech -json        以 JSON 格式输出
   cf-ech -c <domain>  检测指定域名（ECH 实测 + 连接质量评估）
-  cf-ech -t <domain>  对指定域名的 A 记录 IP 进行 ECH TLS 测速
+  cf-ech -t <domain>  对指定域名的 A 记录 IP 进行 ECH + 无 ECH 双模式 TLS 测速
   cf-ech --help       显示帮助信息`);
     return;
   }
@@ -659,7 +708,7 @@ async function main() {
   log(`唯一 IP 数: ${uniqueIPs.length} 个（已跨域名去重）`);
 
   // 6. ECH TLS test each unique IP (2 rounds)
-  log(`开始 ECH TLS 实测 (每 IP 2 轮, 并发 ${CONCURRENCY}, 超时 ${SCAN_TIMEOUT}ms)...`);
+  log(`开始 ECH TLS 实测 (每 IP 2 轮, 并发 ${CONCURRENCY}, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
   const ipResults = {};
   let tested = 0;
   const testTasks = uniqueIPs.map(ip => async () => {

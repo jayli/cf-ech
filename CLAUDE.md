@@ -14,7 +14,7 @@ node bin/cf-ech.js          # 等价
 npx cf-ech -all             # 输出所有 100% 成功率域名
 npx cf-ech -json            # JSON 格式输出
 npx cf-ech -c <domain>      # 单域名检测（每 IP 5 轮 ECH TLS + 延迟/抖动报告）
-npx cf-ech -t <domain>      # 对域名的 A 记录 IP 逐一 ECH TLS 测速
+npx cf-ech -t <domain>      # 对域名的 A 记录 IP 逐一做 ECH + 无 ECH 双模式 TLS 测速（各 5 轮）
 ```
 
 ## 架构
@@ -46,11 +46,10 @@ npx cf-ech -t <domain>      # 对域名的 A 记录 IP 逐一 ECH TLS 测速
 |---|---|
 | `fetchECHConfig(domain)` | 从指定域名的 HTTPS 记录提取 ECH 公钥，带缓存 |
 | `resolveARecords(domain)` | 单次 DNS type 1 查询 |
-| `resolveAllIPs(domain, queries)` | 多次 DNS 查询收集 IP 池（DNS 轮询），合并去重 |
 | `testECHTLS(ip, timeout, sni, echConfig)` | 带 ECH 配置的 TLS 握手，返回 `{ success, elapsed }` |
 | `testTLS(ip, timeout, sni)` | 普通 TLS 握手，ECH config 获取失败时的 fallback |
-| `checkDomain(domain)` | `-c` 单域名检测：3 轮 DNS → CF 验证 → 每 IP 5 轮 ECH TLS → 延迟/抖动/评价 |
-| `testDomain(domain)` | `-t` 测速：A 记录 → 每 IP 2 轮 ECH TLS → 按延迟输出 |
+| `checkDomain(domain)` | `-c` 单域名检测：单次 DNS → CF 验证 → 每 IP 5 轮 ECH TLS → 延迟/抖动/评价 |
+| `testDomain(domain)` | `-t` 测速：A 记录 → 每 IP 5 轮 ECH TLS + 5 轮无 ECH TLS → 双模式延迟/抖动对比 |
 | `runWithPool(tasks, concurrency)` | 固定并发数的任务池 |
 
 ### 降级策略
