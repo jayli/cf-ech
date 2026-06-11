@@ -23,9 +23,8 @@ function log(msg) { process.stderr.write(msg + '\n'); }
 
 function evaluateCheckDomain({ cfIPCount, overallRate, avgLatency, maxJitter }) {
   if (overallRate === 100 && avgLatency < MAX_RECOMMENDED_LATENCY && maxJitter <= MAX_RECOMMENDED_JITTER) {
-    return cfIPCount >= 2
-      ? '评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点'
-      : '评价: 可用 ECH（达不到优选）';
+    if (cfIPCount >= 2) return '评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点';
+    if (cfIPCount === 1) return '评价: 单 IP 优质 ECH 接入点（缺少冗余）';
   }
   if (overallRate >= 90) {
     return '评价: 可用 ECH（达不到优选）';
@@ -56,9 +55,8 @@ function evaluateTestDomain({
     tlsMaxJitter <= MAX_RECOMMENDED_JITTER;
 
   if (echMeetsRecommended) {
-    return cfIPCount >= 2
-      ? '评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点'
-      : '评价: 可用 ECH（达不到优选）';
+    if (cfIPCount >= 2) return '评价: ECH 连接质量优秀，适合作为优选 ECH CF 接入点';
+    if (cfIPCount === 1) return '评价: 单 IP 优质 ECH 接入点（缺少冗余）';
   }
   if (tlsMeetsRecommended) {
     return '评价: 普通 CF 节点（凑合能用）';
