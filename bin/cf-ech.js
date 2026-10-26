@@ -661,30 +661,47 @@ async function testDomain(domain) {
   }));
 }
 
+// ─── CLI args ───
+
+function parseFlags(argv) {
+  return {
+    version: argv.includes('--version') || argv.includes('-v'),
+    help: argv.includes('--help') || argv.includes('-h'),
+    jsonMode: argv.includes('-json'),
+    allMode: argv.includes('-all'),
+    noECH: argv.includes('-no-ech') || argv.includes('--no-ech'),
+  };
+}
+
 // ─── Main ───
 
 async function main() {
   const args = process.argv.slice(2);
-  const jsonMode = args.includes('-json');
-  const allMode = args.includes('-all');
+  const { version, help, jsonMode, allMode, noECH } = parseFlags(args);
 
-  if (args.includes('--version') || args.includes('-v')) {
+  if (version) {
     const pkg = JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
     console.log(pkg.version);
     return;
   }
 
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log(`cf-ech - 发现指向 Cloudflare CDN 且实测支持 ECH 的优质域名
+  if (help) {
+    console.log(`cf-ech - 发现指向 Cloudflare CDN 的优质域名
 
 用法:
-  cf-ech              扫描并输出前 20 个优质域名
+  cf-ech              扫描并输出前 20 个实测支持 ECH 的优质域名
+  cf-ech -no-ech      跳过 ECH 探测，只按普通 TLS 握手筛选优选域名
   cf-ech -all         输出所有实测通过的域名
   cf-ech -json        以 JSON 格式输出
   cf-ech -c <domain>  检测指定域名（ECH 实测 + 连接质量评估）
   cf-ech -t <domain>  对指定域名的 A 记录 IP 进行 ECH + 无 ECH 双模式 TLS 测速
   cf-ech --help       显示帮助信息`);
     return;
+  }
+
+  if (noECH && (args.includes('-t') || args.includes('-c'))) {
+    process.stderr.write('-no-ech 仅用于批量扫描；单域名的无 ECH 结果请用: cf-ech -t <domain>\n');
+    process.exit(1);
   }
 
   const tIdx = args.indexOf('-t');
@@ -724,7 +741,9 @@ async function main() {
     `${d}------------------------------------------------${r}`,
   ].join('\n');
   log(banner);
-  log('正在扫描实测支持 ECH 的 CF 域名列表...');
+  log(noECH
+    ? '正在按普通 TLS 扫描优选 CF 域名列表（已跳过 ECH 探测）...'
+    : '正在扫描实测支持 ECH 的 CF 域名列表...');
   log('');
 
   // 1. Load domains
@@ -748,13 +767,18 @@ async function main() {
   const domains = [...new Set([...localDomains, ...onlineDomains])];
   log(`合并去重: ${domains.length} 个`);
 
-  // 2. Get ECH config once
-  log('获取 ECH 公钥配置...');
-  const echConfig = await fetchECHConfig();
-  if (echConfig) {
-    log(`ECH 公钥: 已获取 (来自 ${ECH_PROVIDER}, ${echConfig.length} bytes)`);
+  // 2. Get ECH config once (skipped entirely in -no-ech mode)
+  let echConfig = null;
+  if (noECH) {
+    log('ECH 公钥: 已跳过 (-no-ech)，仅做普通 TLS 握手');
   } else {
-    log('警告: 无法获取 ECH 公钥配置，将使用普通 TLS 测试（结果准确性降低）');
+    log('获取 ECH 公钥配置...');
+    echConfig = await fetchECHConfig();
+    if (echConfig) {
+      log(`ECH 公钥: 已获取 (来自 ${ECH_PROVIDER}, ${echConfig.length} bytes)`);
+    } else {
+      log('警告: 无法获取 ECH 公钥配置，将使用普通 TLS 测试（结果准确性降低）');
+    }
   }
 
   // 3. DNS resolve all domains
@@ -802,8 +826,8 @@ async function main() {
   const uniqueIPs = Object.keys(ipDomains);
   log(`唯一 IP 数: ${uniqueIPs.length} 个（已跨域名去重）`);
 
-  // 6. ECH TLS test each unique IP (2 rounds)
-  log(`开始 ECH TLS 实测 (每 IP 2 轮, 并发 ${CONCURRENCY}, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
+  // 6. ECH (or plain) TLS test each unique IP (2 rounds)
+  log(`开始 ${echConfig ? 'ECH TLS' : '普通 TLS'} 实测 (每 IP 2 轮, 并发 ${CONCURRENCY}, 超时 ${SCAN_TIMEOUT / 1000}s)...`);
   const ipResults = {};
   let tested = 0;
   const testTasks = uniqueIPs.map(ip => async () => {
@@ -865,7 +889,7 @@ async function main() {
   log(`扫描域名: ${domains.length} | CF 域名: ${Object.keys(domainCFIPs).length} | 100%成功率: ${domainScores.length} | 优选结果: ${outputList.length}`);
   log(`硬性要求: 所有 IP 的 TLS 握手成功率必须 100%，且至少 2 个 IP`);
   log(`评分维度: 平均延迟(70%) + IP间稳定性(20%) + IP数<=3奖励(10%)`);
-  log(`ECH: ${echConfig ? '已启用' : '未启用(普通TLS)'}`);
+  log(`ECH: ${noECH ? '已跳过 (-no-ech)' : echConfig ? '已启用' : '未启用(普通TLS)'}`);
 }
 
 if (require.main === module) {
@@ -879,4 +903,5 @@ module.exports = {
   buildDomainScore,
   evaluateCheckDomain,
   evaluateTestDomain,
+  parseFlags,
 };

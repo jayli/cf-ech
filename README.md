@@ -17,8 +17,11 @@ npx cf-ech
 - 帮助：`npx cf-ech --help`
 - JSON 格式输出：`npx cf-ech -json`
 - 输出所有支持 ECH 的域名：`npx cf-ech -all`
+- 关闭 ECH 探测、只做普通 CF 优选：`npx cf-ech -no-ech`
 - 检测指定域名的 ECH 连接质量：`npx cf-ech -c <domain>`
 - ECH + 无 ECH 双模式测速：`npx cf-ech -t <domain>`
+
+不加参数时只测 ECH：任何一轮 ECH 握手失败都直接排除该域名。如果只想按普通 TLS 握手做 CF 优选（不看 ECH 支持情况），加 `-no-ech`，扫描流程、100% 成功率门槛和评分规则完全一致，只是每轮握手不带 ECH 配置，也不再去 `cloudflare-ech.com` 取公钥。`-no-ech` 可与 `-all` / `-json` 组合。
 
 ### 原理
 
