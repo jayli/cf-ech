@@ -20,8 +20,30 @@ npx cf-ech
 - 关闭 ECH 探测、只做普通 CF 优选：`npx cf-ech -no-ech`
 - 检测指定域名的 ECH 连接质量：`npx cf-ech -c <domain>`
 - ECH + 无 ECH 双模式测速：`npx cf-ech -t <domain>`
+- 启动 HTTP 服务：`npx cf-ech -server`（默认 4837 端口）
 
 不加参数时只测 ECH：任何一轮 ECH 握手失败都直接排除该域名。如果只想按普通 TLS 握手做 CF 优选（不看 ECH 支持情况），加 `-no-ech`，扫描流程、100% 成功率门槛和评分规则完全一致，只是每轮握手不带 ECH 配置，也不再去 `cloudflare-ech.com` 取公钥。`-no-ech` 可与 `-all` / `-json` 组合。
+
+### 服务模式
+
+```
+npx cf-ech -server                      # 监听 0.0.0.0:4837
+npx cf-ech -server 8080                 # 换端口
+npx cf-ech -server -host 127.0.0.1      # 只本机可访问
+```
+
+启动后用浏览器打开 `http://<本机IP>:4837/` 有用法页，也可以直接用 curl。URL 参数就是命令行参数的长名版本，结果边跑边流式返回：
+
+```bash
+curl -N http://127.0.0.1:4837/                              # 默认扫描（前 20）
+curl -N http://127.0.0.1:4837/?all=1                        # 全部结果
+curl -N http://127.0.0.1:4837/?all=1&noech=1                # 只做普通 TLS 优选
+curl    http://127.0.0.1:4837/?json=1                       # JSON 输出（结束时一次性返回）
+curl -N "http://127.0.0.1:4837/?mode=check&domain=example.com"   # 等价于 -c
+curl -N "http://127.0.0.1:4837/?mode=test&domain=example.com"    # 等价于 -t
+```
+
+同一时刻只跑一次扫描，后到的请求排队等待——并发扫描会互相抢带宽，把延迟数字搞脏。服务默认监听 `0.0.0.0`，同网段任何人都能触发扫描；只想本机访问请加 `-host 127.0.0.1`。
 
 ### 原理
 
