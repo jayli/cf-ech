@@ -28,6 +28,7 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 
 数据文件：
 - `data/domains.txt` — 本地域名列表，一行一个（641 个）
+- `data/colos.json` — Cloudflare 边缘节点三字码 → 城市对照表（341 个），取自官方状态页组件名
 
 ### 核心设计原则
 
@@ -43,7 +44,8 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 6. **ECH TLS 实测** — 每个唯一 IP 做 2 轮 `tls.connect({ ech: { config } })` 握手，统计成败和延迟；`-no-ech` 模式下换成普通 `testTLS`，流程与门槛不变
 7. **硬性过滤** — 任何握手失败的域名直接排除，只保留 100% 成功率且至少 2 个 IP 的域名
 8. **评分排序** — `score = 平均延迟 × 70 + IP间稳定性 × 20 + IP数可控性 × 10`（所有 IP 平均延迟越低越好、IP 间延迟差越小越好、3 个以内 IP 不扣分），按分降序、平均延迟/离散度/最快 IP 延迟 tiebreak
-9. **输出** — 默认前 20 个，三列对齐（域名 | IP | 延迟）
+9. **探测边缘接入点** — 对所有握手计时完成后，只对最终要输出的域名做 `GET /cdn-cgi/trace`（显式带 `Host` 头，否则 CF 按 IP 路由返回 403），取 `colo` 三字码，缺失时退回 `cf-ray` 头后缀
+10. **输出** — 默认前 20 个，四列对齐（域名 | IP | 延迟 | 边缘）
 
 ### 关键函数
 
@@ -59,6 +61,10 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 | `runBatchScan(flags, sink)` | 批量扫描全流程，返回 `{ json }`（JSON 模式由调用方统一输出） |
 | `runRequest(flags, sink)` | 单次请求的执行入口，按 `flags.mode` 分发到 check / test / 批量 |
 | `createSink({ write, info, color })` | 输出抽象：CLI 接 stdout/stderr，HTTP 接响应流 |
+| `fetchColo(ip, domain)` | 连到指定 IP 取 `/cdn-cgi/trace` 的 `colo`，失败返回 `null` |
+| `parseTraceColo(body)` | 从 trace 正文里提取 `colo=` 值 |
+| `attachColos(items, opts)` | 给结果行补 `colo` 字段，同一个 (ip, domain) 只探一次 |
+| `describeColo(colo)` | 展示用标签：`LAX 洛杉矶`，未知时 `未知` |
 | `parseFlags(argv)` | 解析 CLI 参数（`-json` / `-all` / `-no-ech` / `-server` / `-host` / `-c` / `-t` / `-h` / `-v`） |
 | `parseQuery(searchParams)` | 把 HTTP query 映射成同一组 flags，非法组合返回 `{ error }` |
 | `createServer({ run, parseQuery, isAppError })` | 构建 HTTP 服务，`run` 可注入以便测试 |
@@ -68,6 +74,21 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 如果 `cloudflare-ech.com` 的 ECH 公钥获取失败，整个扫描降级为普通 TLS 测试，并 stderr 标注警告。`-c` 模式下同样处理。
 
 `-no-ech` 是主动版本：不请求 ECH 公钥，`echConfig` 直接保持 `null`，批量扫描全程走 `testTLS`。它只对批量模式生效，与 `-c` / `-t` 同时使用会报错退出（单域名的无 ECH 结果用 `-t` 看）。
+
+### 边缘接入点（colo）
+
+默认开启，没有开关。四列输出、`-c` / `-t` 的每行 IP、`-json` 与 HTTP 结果都带 colo。
+
+关键区分：**colo 是实测的接入点，不是 IP 的地理位置**。Cloudflare 的 anycast 让全球边缘共享同一批 IP，GeoIP 库对这类 IP 只会返回前缀注册地（实测 `162.159.140.220` 真实落地 LHR、`172.66.0.218` 真实落地 LAX，ip-api.com 两者都答「多伦多」）。所以这条数据只能从那台节点自己问出来：`GET https://<域名>/cdn-cgi/trace`，读 `colo=`。
+
+实现约束（踩过的坑）：
+- **必须显式带 `Host: <domain>` 头**。用 IP 做 `host` 时 Node 会把 Host 写成 IP，CF 按 Host 找站点，结果 403 拿不到 trace。
+- **`colo` 绝不参与评分**。探测失败返回 `null`，展示为「未知」，成功率/延迟/排序完全不受影响。
+- **探测排在所有握手计时之后**。多出来的连接会抢带宽把延迟数字搞脏，而这工具的全部意义就是延迟。批量模式只探最终输出的那 20 条（或 `-all` 的全部），不做全量。
+- **正文被改写时退回 `cf-ray` 响应头后缀**，那个三字码和 `colo=` 是同一个。
+- 只有域名本身在 CF 后面才拿得到；`data/domains.txt` 里有一批域名 CNAME 到第三方拦截页（实测解析到 `59.82.113.122`，阿里云壳告警页），会被第 4 步的 CF 网段过滤挡掉。
+
+共两个探测失败来源：CF 侧的 WAF / Bot Fight Mode 拦 `/cdn-cgi/trace`，以及域名本身不在 CF 后面。官方也明确说 trace 是调试端点、格式不保证稳定，所以解析必须容错。
 
 ## 服务模式（`-server`）
 

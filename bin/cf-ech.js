@@ -7,6 +7,8 @@ const { readFileSync } = require('fs');
 const path = require('path');
 
 const DOMAIN_FILE = path.join(__dirname, '..', 'data', 'domains.txt');
+const COLOS_FILE = path.join(__dirname, '..', 'data', 'colos.json');
+const TRACE_PATH = '/cdn-cgi/trace';
 const CF_TOP20_API = 'https://vps789.com/openApi/cfIpTop20';
 const CF_IPS_URL = 'https://api.cloudflare.com/client/v4/ips';
 const ECH_PROVIDER = 'cloudflare-ech.com';
@@ -16,6 +18,7 @@ const DOH_SERVERS = [
 ];
 const CONCURRENCY = 50;
 const SCAN_TIMEOUT = 5000;
+const COLO_TIMEOUT = 5000;
 const MAX_RECOMMENDED_LATENCY = 800; // ms — 优选节点的平均延迟上限
 const MAX_RECOMMENDED_JITTER = 1000; // ms — 优选节点的单 IP 抖动上限
 
@@ -298,6 +301,110 @@ async function resolveARecords(domain) {
   }
 }
 
+// ─── 边缘接入点（colo）───
+
+// 三字码 → 城市，取自 Cloudflare 官方状态页的组件名（"Los Angeles, United States - (LAX)"）。
+// 内置成文件是为了不多依赖一个会变的接口；缺失时降级成只显示三字码。
+let coloCityCache = null;
+
+function loadColoCityMap() {
+  if (coloCityCache) return coloCityCache;
+  try {
+    coloCityCache = JSON.parse(readFileSync(COLOS_FILE, 'utf8'));
+  } catch {
+    coloCityCache = {};
+  }
+  return coloCityCache;
+}
+
+// 常用接入点的中文名；未收录的退回英文城市名。
+const COLO_CITY_ZH = {
+  LAX: '洛杉矶', SJC: '圣何塞', SEA: '西雅图', SFO: '旧金山',
+  NRT: '东京', KIX: '大阪', ICN: '首尔', TPE: '台北', HKG: '香港',
+  SIN: '新加坡', KUL: '吉隆坡', BKK: '曼谷', CGK: '雅加达',
+  LHR: '伦敦', FRA: '法兰克福', AMS: '阿姆斯特丹', CDG: '巴黎',
+  SYD: '悉尼', MEX: '墨西哥城', SCL: '圣地亚哥', GRU: '圣保罗',
+};
+
+function coloCity(colo) {
+  if (!colo) return null;
+  return COLO_CITY_ZH[colo] || loadColoCityMap()[colo] || null;
+}
+
+// 展示用标签："LAX 洛杉矶"，只有三字码时就是 "LAX"，拿不到就是 "未知"。
+function describeColo(colo) {
+  if (!colo) return '未知';
+  const city = coloCity(colo);
+  return city ? `${colo} ${city}` : colo;
+}
+
+// 从 /cdn-cgi/trace 的正文里取 colo。正文是每行一个 key=value 的纯文本。
+function parseTraceColo(body) {
+  if (typeof body !== 'string') return null;
+  const m = /^colo=([A-Za-z0-9]{3,})$/m.exec(body);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// 想问出「这次握手落在了哪个 CF 边缘节点」，只有一条路：连上去要 /cdn-cgi/trace。
+// 这是 Cloudflare 在每个它代理的域名下自带的调试端点，colo 由 CF 按实际接入点填写。
+// 用 GeoIP 查 IP 对 CF 的 anycast 地址是错的：全球边缘共享同一批 IP，
+// 地理库只会告诉你这块前缀注册在哪（常见答案是多伦多），跟你的真实落地无关。
+// 拿不到就返回 null —— colo 只作标注，绝不参与评分。
+function fetchColo(ip, domain, timeoutMs = COLO_TIMEOUT) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = https.get({
+      host: ip,
+      port: 443,
+      path: TRACE_PATH,
+      servername: domain,
+      // 必须显式给 Host：用 IP 做 host 时 Node 会把 Host 写成 IP，
+      // CF 按 Host 找站点，用 IP 路由会拿不到 trace（返回空或报错页）。
+      headers: { host: domain },
+      method: 'GET',
+      timeout: timeoutMs,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const colo = parseTraceColo(Buffer.concat(chunks).toString('utf8'));
+        if (colo) return finish(colo);
+        // 正文被改写时退回响应头：cf-ray 的后缀就是同一个三字码。
+        const ray = String(res.headers['cf-ray'] || '');
+        const m = /-([A-Z]{3})$/.exec(ray);
+        finish(m ? m[1] : null);
+      });
+      res.on('error', () => finish(null));
+    });
+    req.on('timeout', () => { req.destroy(); finish(null); });
+    req.on('error', () => finish(null));
+  });
+}
+
+// 给结果列表补 colo 字段。每条结果需要 ip 和 domain（也可用 domain 选项统一指定，
+// 因为 -c / -t 的结果行只带 ip），同一个 (ip, domain) 只探一次。
+// 调用点都放在所有握手计时结束之后，避免多出来的连接干扰延迟数字。
+async function attachColos(items, { concurrency = CONCURRENCY, domain = null, fetch = fetchColo } = {}) {
+  const cache = new Map();
+  const tasks = items.map(item => async () => {
+    const target = item.domain || domain;
+    if (!item.ip || !target) {
+      item.colo = null;
+      return;
+    }
+    const key = `${item.ip}|${target}`;
+    if (!cache.has(key)) cache.set(key, fetch(item.ip, target));
+    item.colo = await cache.get(key);
+  });
+  await runWithPool(tasks, concurrency);
+  return items;
+}
+
 // ─── Network utilities ───
 
 function fetchJSON(url) {
@@ -480,7 +587,12 @@ async function checkDomain(domain, sink) {
     }
   }
 
-  // 5. Output results
+  // 5. 握手计时全部结束后再探 colo，避免多出来的连接干扰延迟数字
+  sink.info('');
+  sink.info('探测边缘接入点 (colo)...');
+  await attachColos(results, { domain });
+
+  // 6. Output results
   sink.info('');
   const maxIPLen = Math.max(...results.map(r => r.ip.length));
   // Sort: successful IPs by avg latency ascending, failed IPs at bottom
@@ -494,13 +606,13 @@ async function checkDomain(domain, sink) {
     const ratePct = Math.round(r.successRate * 100);
     if (r.successes > 0) {
       const jitter = r.max - r.min;
-      sink.data(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)`);
+      sink.data(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)  边缘: ${describeColo(r.colo)}`);
     } else {
       sink.data(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  全部超时`);
     }
   }
 
-  // 6. Summary + evaluation
+  // 7. Summary + evaluation
   const totalSuccess = results.reduce((s, r) => s + r.successes, 0);
   const totalTests = results.length * 5;
   const overallRate = Math.round(totalSuccess / totalTests * 100);
@@ -573,7 +685,7 @@ async function testDomain(domain, sink) {
       const ratePct = Math.round(r.successRate * 100);
       if (r.successes > 0) {
         const jitter = r.max - r.min;
-        sink.data(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)`);
+        sink.data(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  延迟: ${r.avg}ms (${r.min}~${r.max}ms, 抖动 ${jitter}ms)  边缘: ${describeColo(r.colo)}`);
       } else {
         sink.data(`  ${r.ip.padEnd(maxIPLen + 2)}成功率: ${ratePct}%  全部超时`);
       }
@@ -604,9 +716,6 @@ async function testDomain(domain, sink) {
     }
   }
 
-  sink.info('');
-  printResults(echResults);
-
   // --- 普通 TLS 测速 (5 rounds) ---
   sink.info('');
   sink.info(`测速 (普通 TLS, 每 IP 5 轮, 超时 ${SCAN_TIMEOUT / 1000}s)`);
@@ -629,7 +738,18 @@ async function testDomain(domain, sink) {
     }
   }
 
+  // 两种模式的握手计时都跑完再探 colo：避免多出来的连接插进延迟测量里。
+  // 同一个 (ip, domain) 两段结果共享一次探测，两次 printResults 都拿得到。
   sink.info('');
+  sink.info('探测边缘接入点 (colo)...');
+  await attachColos([...echResults, ...tlsResults], { domain });
+
+  sink.info('');
+  sink.info('ECH TLS 测速结果');
+  printResults(echResults);
+
+  sink.info('');
+  sink.info('普通 TLS 测速结果');
   printResults(tlsResults);
 
   // Summary + evaluation
@@ -932,13 +1052,20 @@ async function runBatchScan(flags, sink) {
   // 8. Output
   const outputList = allMode ? domainScores : domainScores.slice(0, 20);
 
+  // 只对真正要输出的那几条探 colo：全量探会多出上百条连接，且探了也没人看。
+  // 放在第 6 步所有计时结束后，不干扰延迟数字。
+  sink.info(`探测边缘接入点 (colo): ${outputList.length} 个域名...`);
+  await attachColos(outputList);
+
   if (jsonMode) {
     return { json: outputList };
   }
 
   const maxDomainLen = Math.max(...outputList.map(r => r.domain.length));
+  const maxIPLen = Math.max(...outputList.map(r => r.ip.length));
+  const maxLatencyLen = Math.max(...outputList.map(r => String(r.elapsed).length));
   for (const r of outputList) {
-    sink.data(`${r.domain.padEnd(maxDomainLen + 2)}${r.ip.padEnd(18)}${r.elapsed}ms`);
+    sink.data(`${r.domain.padEnd(maxDomainLen + 2)}${r.ip.padEnd(maxIPLen + 2)}${`${r.elapsed}ms`.padEnd(maxLatencyLen + 3)}${describeColo(r.colo)}`);
   }
 
   // 9. Report (stderr)
@@ -946,6 +1073,7 @@ async function runBatchScan(flags, sink) {
   sink.info(`扫描域名: ${domains.length} | CF 域名: ${Object.keys(domainCFIPs).length} | 100%成功率: ${domainScores.length} | 优选结果: ${outputList.length}`);
   sink.info(`硬性要求: 所有 IP 的 TLS 握手成功率必须 100%，且至少 2 个 IP`);
   sink.info(`评分维度: 平均延迟(70%) + IP间稳定性(20%) + IP数<=3奖励(10%)`);
+  sink.info(`边缘列: colo 是本次实测的 CF 接入点（受本机网络环境影响），非域名固有属性`);
   sink.info(`ECH: ${noECH ? '已跳过 (-no-ech)' : echConfig ? '已启用' : '未启用(普通TLS)'}`);
 }
 
@@ -1062,10 +1190,16 @@ module.exports = {
   AppError,
   createSink,
   buildDomainScore,
+  attachColos,
+  coloCity,
+  describeColo,
   evaluateCheckDomain,
   evaluateTestDomain,
+  fetchColo,
+  loadColoCityMap,
   parseFlags,
   parseQuery,
+  parseTraceColo,
   runBatchScan,
   runRequest,
 };
