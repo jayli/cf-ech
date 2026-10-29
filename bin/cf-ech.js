@@ -5,6 +5,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { readFileSync } = require('fs');
 const path = require('path');
+const { agentForUrl, detectSystemProxy } = require('./proxy.js');
 
 const DOMAIN_FILE = path.join(__dirname, '..', 'data', 'domains.txt');
 const COLOS_FILE = path.join(__dirname, '..', 'data', 'colos.json');
@@ -35,6 +36,26 @@ function createSink({ write, info, color = false }) {
 
 // 可预期的失败（无 A 记录、非 CF 域名等）：CLI 转 exit 1，HTTP 转 400。
 class AppError extends Error {}
+
+// 代理降级只提示一次，避免几百个域名每个都刷一行。
+let proxyWarned = false;
+function warnOnce(msg) {
+  if (proxyWarned) return;
+  proxyWarned = true;
+  process.stderr.write(`警告: ${msg}\n`);
+}
+
+// 扫描开头说明代理状态，让用户能确认它确实挂上了（走 sink.info，不污染 -json 的 stdout）。
+function describeProxy() {
+  const detection = detectSystemProxy();
+  if (detection.proxy) {
+    return `系统代理: ${detection.proxy.url}（仅控制面请求，测速直连）`;
+  }
+  if (detection.socksOnly) {
+    return '系统代理: 仅有 SOCKS，暂不支持，全部直连';
+  }
+  return '系统代理: 未启用，全部直连';
+}
 
 function evaluateCheckDomain({ cfIPCount, overallRate, avgLatency, maxJitter }) {
   if (overallRate === 100 && avgLatency < MAX_RECOMMENDED_LATENCY && maxJitter <= MAX_RECOMMENDED_JITTER) {
@@ -222,8 +243,32 @@ function parseHTTPSRecord(rdata) {
   return { priority, svcParams };
 }
 
-function queryDoHSingle(server, query) {
-  return new Promise((resolve, reject) => {
+// 控制面请求（域名列表 / CF 网段 / DoH）优先走系统代理，失败时降级直连。
+// 测速握手不经过这里 —— 走代理量到的是代理的延迟，不是这条 CF 线路的真实延迟。
+// 返回 { value, viaProxy }，viaProxy 为 true 表示结果确实来自代理。
+//
+// 代理路径重试一次再降级：keep-alive 池里的空隧道可能已被代理侧关掉，
+// 复用时首包会失败（实测 664 个域名里约 1 次 bad record mac）。
+async function withProxyRetry(url, run, warn = () => {}) {
+  const detection = detectSystemProxy();
+  const agent = agentForUrl(url, detection);
+  if (!agent) return { value: await run(null), viaProxy: false };
+
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return { value: await run(agent), viaProxy: true };
+    } catch (e) {
+      lastError = e;
+    }
+  }
+
+  warn(`系统代理 ${detection.proxy.url} 不可用（${lastError.message}），改直连`);
+  return { value: await run(null), viaProxy: false };
+}
+
+function queryDoHSingle(server, query, warn) {
+  return withProxyRetry(server, (agent) => new Promise((resolve, reject) => {
     const url = new URL(server);
     const options = {
       hostname: url.hostname,
@@ -237,6 +282,7 @@ function queryDoHSingle(server, query) {
       },
       timeout: 10000,
     };
+    if (agent) options.agent = agent;
     const req = https.request(options, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -249,14 +295,14 @@ function queryDoHSingle(server, query) {
     req.on('error', reject);
     req.write(query);
     req.end();
-  });
+  }), warn).then(r => r.value);
 }
 
 async function queryDoH(domain, type = 65) {
   const query = buildDnsQuery(domain, type);
   for (const server of DOH_SERVERS) {
     try {
-      return await queryDoHSingle(server, query);
+      return await queryDoHSingle(server, query, warnOnce);
     } catch {}
   }
   throw new Error('所有 DoH 服务器查询失败');
@@ -408,8 +454,10 @@ async function attachColos(items, { concurrency = CONCURRENCY, domain = null, fe
 // ─── Network utilities ───
 
 function fetchJSON(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { timeout: 10000 }, (res) => {
+  return withProxyRetry(url, (agent) => new Promise((resolve, reject) => {
+    const options = { timeout: 10000 };
+    if (agent) options.agent = agent;
+    https.get(url, options, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
@@ -417,7 +465,7 @@ function fetchJSON(url) {
         catch (e) { reject(e); }
       });
     }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('timeout')); });
-  });
+  }), warnOnce).then(r => r.value);
 }
 
 function ipToNum(ip) {
@@ -921,6 +969,7 @@ async function runBatchScan(flags, sink) {
   sink.info(noECH
     ? '正在按普通 TLS 扫描优选 CF 域名列表（已跳过 ECH 探测）...'
     : '正在扫描实测支持 ECH 的 CF 域名列表...');
+  sink.info(describeProxy());
   sink.info('');
 
   // 1. Load domains
@@ -1193,6 +1242,7 @@ module.exports = {
   attachColos,
   coloCity,
   describeColo,
+  describeProxy,
   evaluateCheckDomain,
   evaluateTestDomain,
   fetchColo,

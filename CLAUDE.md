@@ -25,6 +25,7 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 两个文件：
 - `bin/cf-ech.js` — CLI 入口、DNS/TLS 实测、评分、参数解析、请求执行（约 1060 行）
 - `bin/server.js` — HTTP 服务：路由、流式响应、扫描排队（无业务逻辑）
+- `bin/proxy.js` — 系统代理探测 + 零依赖 HTTP CONNECT 隧道 Agent
 
 数据文件：
 - `data/domains.txt` — 本地域名列表，一行一个（641 个）
@@ -63,13 +64,32 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 | `createSink({ write, info, color })` | 输出抽象：CLI 接 stdout/stderr，HTTP 接响应流 |
 | `fetchColo(ip, domain)` | 连到指定 IP 取 `/cdn-cgi/trace` 的 `colo`，失败返回 `null` |
 | `parseTraceColo(body)` | 从 trace 正文里提取 `colo=` 值 |
+| `describeProxy()` | 扫描开头那行代理状态文案（`系统代理: …（仅控制面请求，测速直连）`） |
+| `withProxyRetry(url, run, warn)` | 控制面请求统一入口：优先走系统代理，失败降级直连并报警一次 |
+| `detectSystemProxy()` | 仅 macOS：`scutil --proxy` → `{ proxy, socksOnly, exceptions }`，结果缓存 |
+| `parseScutilProxy(text)` | 纯函数，解析 `scutil --proxy` 的嵌套字典文本与例外列表 |
+| `ConnectProxyAgent` | `https.Agent` 子类：先 `CONNECT host:port` 建隧道，再在隧道上 `tls.connect` |
 | `attachColos(items, opts)` | 给结果行补 `colo` 字段，同一个 (ip, domain) 只探一次 |
 | `describeColo(colo)` | 展示用标签：`LAX 洛杉矶`，未知时 `未知` |
 | `parseFlags(argv)` | 解析 CLI 参数（`-json` / `-all` / `-no-ech` / `-server` / `-host` / `-c` / `-t` / `-h` / `-v`） |
 | `parseQuery(searchParams)` | 把 HTTP query 映射成同一组 flags，非法组合返回 `{ error }` |
 | `createServer({ run, parseQuery, isAppError })` | 构建 HTTP 服务，`run` 可注入以便测试 |
 
-### 降级策略
+### 代理（自动，仅控制面）
+
+Node 的 `https` 不读 macOS 系统代理表（那是 CFNetwork 的配置），也不读 `HTTPS_PROXY`（要 `--use-env-proxy` 才认），所以 `curl` 能通的地址这个工具可能直连被挡（实测 `vps789.com`：直连 403，过代理 200）。
+
+`bin/proxy.js` 补上这一步：macOS 读系统代理，控制面请求（在线域名列表、CF 网段、DoH）过代理，失败静默降级直连。
+
+关键约束（改这块时不要破坏）：
+- **测速握手必须直连。** `testECHTLS` / `testTLS` / `fetchColo` 走代理的话，量到的是「代理到目标」的延迟，工具的全部意义（真实线路延迟）就没了。只有 `fetchJSON` 和 `queryDoHSingle` 接代理。
+- **不预设端口。** 端口从系统配置读，换电脑换端口不用改代码。
+- **零依赖。** 自写 `CONNECT` 隧道（约 40 行），不引入 `undici` / `ProxyAgent`。
+- **降级必须静默且只报一次。** 几百个域名并发时每个都打一行会把输出淹掉，`warnOnce` 管这个。
+- **非 macOS 一律直连。** Windows 代理在注册表、Linux 在 gsettings，`detectSystemProxy` 是 provider 形式，以后加平台实现不影响其他代码。
+- **SOCKS 未实现。** 仅开 SOCKS 时 `socksOnly` 为 true，提示后直连（目前机器上 HTTP/HTTPS 代理都开着，不影响）。
+
+## 降级策略
 
 如果 `cloudflare-ech.com` 的 ECH 公钥获取失败，整个扫描降级为普通 TLS 测试，并 stderr 标注警告。`-c` 模式下同样处理。
 
