@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const tls = require('tls');
+const net = require('net');
 const https = require('https');
 const crypto = require('crypto');
 const { readFileSync } = require('fs');
@@ -20,6 +21,11 @@ const DOH_SERVERS = [
 const CONCURRENCY = 50;
 const SCAN_TIMEOUT = 5000;
 const COLO_TIMEOUT = 5000;
+// -6 开跑前先直连这几个 Cloudflare IPv6 地址探一下出口；全超时说明本机没有可用 IPv6 出网，
+// 与其跑完几百次超时握手再给一个空结果，不如立刻报错停下。测速握手必须直连（不走代理），
+// 所以这里也用裸 TCP 直连，量到的才是本机真实的 IPv6 出网能力。
+const IPV6_EGRESS_TARGETS = ['2606:4700:4700::1111', '2606:4700:4700::1001'];
+const IPV6_EGRESS_TIMEOUT = 4000;
 const MAX_RECOMMENDED_LATENCY = 800; // ms — 优选节点的平均延迟上限
 const MAX_RECOMMENDED_JITTER = 1000; // ms — 优选节点的单 IP 抖动上限
 
@@ -552,6 +558,54 @@ async function fetchCFCIDRs(ipVersion = 4) {
   return null;
 }
 
+// ─── IPv6 出口预检 ───
+
+// 裸 TCP 直连一个 IPv6 字面量，连上即认为有出口。不做 TLS：这一步只回答
+// 「本机能不能把 v6 包发出去」，握手细节留给后面的实测。
+function probeIPv6(ip, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    const socket = net.connect({ host: ip, port, timeout: timeoutMs, family: 6 }, () => done(true));
+    socket.on('timeout', () => done(false));
+    socket.on('error', () => done(false));
+  });
+}
+
+// 任一目标连通就算有出口（单个 IP 偶发不可达不该误判成全局断网）。
+async function checkIPv6Egress({
+  targets = IPV6_EGRESS_TARGETS,
+  port = 443,
+  timeoutMs = IPV6_EGRESS_TIMEOUT,
+  probe = probeIPv6,
+} = {}) {
+  const results = await Promise.all(targets.map(ip => probe(ip, port, timeoutMs)));
+  return results.some(Boolean);
+}
+
+// -6 模式的闸门：出口不通就抛 AppError 停下（CLI exit 1 / HTTP 400）。
+async function assertIPv6Egress(ipVersion, sink, { check = checkIPv6Egress } = {}) {
+  if (ipVersion !== 6) return;
+  sink.info('检测本机 IPv6 出口...');
+  if (await check()) {
+    sink.info('IPv6 出口: 正常');
+    return;
+  }
+  throw new AppError(
+    '本机没有可用的 IPv6 出口，无法按 IPv6 优选。\n'
+    + `  直连 ${IPV6_EGRESS_TARGETS.join(' / ')}:443 全部超时。\n`
+    + '  测速握手是直连的（不走代理），所以代理能翻墙也帮不上这一步。\n'
+    + '  自检: curl -6 https://cloudflare-ech.com/cdn-cgi/trace —— 返回的 ip= 必须是 2xxx: 开头的 IPv6。\n'
+    + '  常见原因: 运营商未放行 IPv6 / 光猫或路由的 IPv6 断了 / 被 TUN 抢了默认路由却没有真出口。\n'
+    + '  改用 IPv4: cf-ech（去掉 -6）'
+  );
+}
+
 // ─── TLS testing ───
 
 function testTLS(ip, timeoutMs, sni) {
@@ -1052,6 +1106,9 @@ async function runBatchScan(flags, sink) {
   sink.info(describeProxy());
   sink.info('');
 
+  // -6 先探出口：不通直接报错，不白跑几百次超时握手。
+  await assertIPv6Egress(ipVersion, sink);
+
   // 1. Load domains
   const localDomains = readFileSync(DOMAIN_FILE, 'utf8')
     .trim().split('\n').map(d => d.trim()).filter(Boolean);
@@ -1332,6 +1389,9 @@ if (require.main === module) {
 
 module.exports = {
   AppError,
+  IPV6_EGRESS_TARGETS,
+  assertIPv6Egress,
+  checkIPv6Egress,
   createSink,
   buildDomainScore,
   attachColos,

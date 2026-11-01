@@ -66,6 +66,8 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 | `fetchColo(ip, domain)` | 连到指定 IP 取 `/cdn-cgi/trace` 的 `colo`，失败返回 `null` |
 | `parseTraceColo(body)` | 从 trace 正文里提取 `colo=` 值 |
 | `describeProxy()` | 扫描开头那行代理状态文案（`系统代理: …（仅控制面请求，测速直连）`） |
+| `checkIPv6Egress(opts)` | 并发裸 TCP 直连多个 CF IPv6 目标，任一连通即 `true`；`probe` 可注入以便测试 |
+| `assertIPv6Egress(ipVersion, sink)` | `-6` 的闸门：出口不通抛 `AppError`，v4 直接返回 |
 | `withProxyRetry(url, run, warn)` | 控制面请求统一入口：优先走系统代理，失败降级直连并报警一次 |
 | `detectSystemProxy()` | 仅 macOS：`scutil --proxy` → `{ proxy, socksOnly, exceptions }`，结果缓存 |
 | `parseScutilProxy(text)` | 纯函数，解析 `scutil --proxy` 的嵌套字典文本与例外列表 |
@@ -104,7 +106,8 @@ Node 的 `https` 不读 macOS 系统代理表（那是 CFNetwork 的配置），
 - **v6 网段匹配用 128 位 BigInt**（`ipInCIDRv6`）：超出 Number 安全整数范围，位移会静默丢位。`ipInCIDRList` 按地址形态自动选 v4/v6 匹配。
 - **入选门槛放宽到 1 个 IP**（`buildDomainScore` 的 `minIPs`）：大量域名 AAAA 只有一两条，沿用 2 会几乎筛不出结果。100% 成功率门槛不变。
 - **TLS/colo 探测对 IPv6 字面量无需特殊处理**：`tls.connect({ host })` / `https.get({ host })` 原生支持 `2606:4700::1` 这类写法。
-- **仅批量模式**：与 `-c` / `-t` 同时使用报错退出，`-4` 与 `-6` 互斥。本机无 IPv6 出口时所有握手超时、结果为空，属预期行为。
+- **仅批量模式**：与 `-c` / `-t` 同时使用报错退出，`-4` 与 `-6` 互斥。
+- **开跑前先探 IPv6 出口**（`assertIPv6Egress`）：直连 Cloudflare 的 `2606:4700:4700::1111` / `::1001` 的 443，任一 TCP 连上即放行；全部超时则抛 `AppError` 停下（CLI exit 1、HTTP 400），不白跑几百次超时握手再给一个空结果。探测用裸 TCP 而非 TLS，且必须直连——测速握手不走代理，代理能翻墙也帮不上这一步。IPv4 模式完全跳过。
 
 ### 边缘接入点（colo）
 
