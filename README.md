@@ -17,12 +17,22 @@ npx cf-ech
 - 帮助：`npx cf-ech --help`
 - JSON 格式输出：`npx cf-ech -json`
 - 输出所有支持 ECH 的域名：`npx cf-ech -all`
+- 按 IPv6（AAAA 记录）优选：`npx cf-ech -6`
 - 关闭 ECH 探测、只做普通 CF 优选：`npx cf-ech -no-ech`
 - 检测指定域名的 ECH 连接质量：`npx cf-ech -c <domain>`
 - ECH + 无 ECH 双模式测速：`npx cf-ech -t <domain>`
 - 启动 HTTP 服务：`npx cf-ech -server`（默认 4837 端口）
 
-不加参数时只测 ECH：任何一轮 ECH 握手失败都直接排除该域名。如果只想按普通 TLS 握手做 CF 优选（不看 ECH 支持情况），加 `-no-ech`，扫描流程、100% 成功率门槛和评分规则完全一致，只是每轮握手不带 ECH 配置，也不再去 `cloudflare-ech.com` 取公钥。`-no-ech` 可与 `-all` / `-json` 组合。
+不加参数时只测 ECH：任何一轮 ECH 握手失败都直接排除该域名。如果只想按普通 TLS 握手做 CF 优选（不看 ECH 支持情况），加 `-no-ech`，扫描流程、100% 成功率门槛和评分规则完全一致，只是每轮握手不带 ECH 配置，也不再去 `cloudflare-ech.com` 取公钥。`-no-ech` 可与 `-all` / `-json` / `-6` 组合。
+
+### 地址族（IPv4 / IPv6）
+
+默认按 IPv4 优选，解析域名的 A 记录。`-6` 切到 IPv6：解析 AAAA 记录、用 CF 的 `ipv6_cidrs` 网段过滤、对 IPv6 地址做同样的 ECH/TLS 握手实测与评分。`-4` 是显式的默认值，不传也一样。
+
+两点区别值得知道：
+
+- **入选门槛放宽到至少 1 个 IP。** IPv4 要求「所有 IP 握手 100% 成功且至少 2 个 IP」（要有冗余），但大量域名的 AAAA 记录只有一两条，沿用 2 会几乎筛不出结果，所以 `-6` 下只要求 1 个。100% 成功率门槛和评分规则不变。
+- **本机必须有 IPv6 出口。** 没有的话所有握手都会超时，结果为空——这不是工具的 bug，是网络环境。`-6` 仅用于批量扫描，与 `-c` / `-t` 同时使用会报错退出。
 
 ### 代理（自动）
 
@@ -70,6 +80,7 @@ npx cf-ech -server -host 127.0.0.1      # 只本机可访问
 ```bash
 curl -N http://127.0.0.1:4837/                              # 默认扫描（前 20）
 curl -N http://127.0.0.1:4837/?all=1                        # 全部结果
+curl -N http://127.0.0.1:4837/?ip=6                         # 按 IPv6（AAAA 记录）优选
 curl -N http://127.0.0.1:4837/?all=1&noech=1                # 只做普通 TLS 优选
 curl    http://127.0.0.1:4837/?json=1                       # JSON 输出（结束时一次性返回）
 curl -N "http://127.0.0.1:4837/?mode=check&domain=example.com"   # 等价于 -c

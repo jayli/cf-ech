@@ -18,6 +18,19 @@ test('penalizes domains with high latency spread across successful IPs', () => {
   assert.equal(uneven.spread, 170);
 });
 
+test('requires at least two IPs by default but one with minIPs 1', () => {
+  const ipResults = {
+    '2606:4700::1': { success: true, successCount: 2, elapsed: 60 },
+  };
+
+  assert.equal(buildDomainScore('one.example', ['2606:4700::1'], ipResults), null);
+
+  const single = buildDomainScore('one.example', ['2606:4700::1'], ipResults, { minIPs: 1 });
+  assert.ok(single);
+  assert.equal(single.ipCount, 1);
+  assert.equal(single.ip, '2606:4700::1');
+});
+
 test('starts penalizing IP count only after three IPs', () => {
   const threeIPs = buildDomainScore('three.example', ['104.3.3.1', '104.3.3.2', '104.3.3.3'], {
     '104.3.3.1': { success: true, successCount: 2, elapsed: 100 },

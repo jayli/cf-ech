@@ -10,11 +10,30 @@ test('defaults every flag to off when no arguments are given', () => {
     jsonMode: false,
     allMode: false,
     noECH: false,
+    ipVersion: 4,
+    ipVersionConflict: false,
     serverPort: null,
     host: null,
     mode: null,
     domain: null,
   });
+});
+
+test('defaults to IPv4 and accepts -4 as an explicit restatement', () => {
+  assert.equal(parseFlags([]).ipVersion, 4);
+  assert.equal(parseFlags(['-4']).ipVersion, 4);
+  assert.equal(parseFlags(['--ipv4']).ipVersion, 4);
+  assert.equal(parseFlags(['-4']).ipVersionConflict, false);
+});
+
+test('selects IPv6 scanning with -6', () => {
+  assert.equal(parseFlags(['-6']).ipVersion, 6);
+  assert.equal(parseFlags(['--ipv6']).ipVersion, 6);
+  assert.equal(parseFlags(['-6', '-all', '-json']).ipVersion, 6);
+});
+
+test('reports -4 and -6 given together as a conflict', () => {
+  assert.equal(parseFlags(['-4', '-6']).ipVersionConflict, true);
 });
 
 test('enables no-ECH scanning for both flag spellings', () => {

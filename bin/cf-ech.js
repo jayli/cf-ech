@@ -106,7 +106,9 @@ function evaluateTestDomain({
   return '评价: 无法连接，不可用';
 }
 
-function buildDomainScore(domain, ips, ipResults) {
+// minIPs：入选所需的最少 IP 数。IPv4 默认 2（要有冗余）；IPv6 放宽到 1，
+// 因为大量域名的 AAAA 记录只有一两条，沿用 2 会几乎筛不出结果。
+function buildDomainScore(domain, ips, ipResults, { minIPs = 2 } = {}) {
   let totalSuccess = 0;
   const latencies = [];
   for (const ip of ips) {
@@ -119,7 +121,7 @@ function buildDomainScore(domain, ips, ipResults) {
 
   const totalTests = ips.length * 2;
   const successRate = totalTests > 0 ? totalSuccess / totalTests : 0;
-  if (successRate < 1 || ips.length < 2) return null;
+  if (successRate < 1 || ips.length < minIPs) return null;
 
   const avgLatency = Math.round(latencies.reduce((sum, ms) => sum + ms, 0) / latencies.length);
   const minLatency = Math.min(...latencies);
@@ -336,12 +338,44 @@ async function fetchECHConfig(domain = ECH_PROVIDER) {
 
 // ─── DNS resolution ───
 
-async function resolveARecords(domain) {
+function parseARecord(rdata) {
+  if (rdata.length !== 4) return null;
+  return `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
+}
+
+// AAAA 的 rdata 是 16 字节，按 RFC 5952 写成标准文本：全零组最长的一段（≥2 组）压成 ::。
+// 不压缩也能连，但输出里一长串 0000 没法看，而且同一个地址会有多种写法、破坏 IP 去重。
+function formatIPv6(rdata) {
+  if (!rdata || rdata.length !== 16) return null;
+  const groups = [];
+  for (let i = 0; i < 16; i += 2) groups.push(rdata.readUInt16BE(i));
+
+  let bestStart = -1;
+  let bestLen = 0;
+  let start = -1;
+  for (let i = 0; i <= 8; i++) {
+    if (i < 8 && groups[i] === 0) {
+      if (start === -1) start = i;
+    } else if (start !== -1) {
+      if (i - start > bestLen) { bestLen = i - start; bestStart = start; }
+      start = -1;
+    }
+  }
+
+  const hex = groups.map(g => g.toString(16));
+  if (bestLen < 2) return hex.join(':');
+  return `${hex.slice(0, bestStart).join(':')}::${hex.slice(bestStart + bestLen).join(':')}`;
+}
+
+// ipVersion 4 → A 记录（type 1），6 → AAAA 记录（type 28）。解析失败一律返回空数组。
+async function resolveRecords(domain, ipVersion = 4) {
+  const type = ipVersion === 6 ? 28 : 1;
   try {
-    const answers = await queryDoH(domain, 1);
+    const answers = await queryDoH(domain, type);
     return answers
-      .filter(a => a.type === 1)
-      .map(a => `${a.rdata[0]}.${a.rdata[1]}.${a.rdata[2]}.${a.rdata[3]}`);
+      .filter(a => a.type === type)
+      .map(a => (ipVersion === 6 ? formatIPv6(a.rdata) : parseARecord(a.rdata)))
+      .filter(Boolean);
   } catch {
     return [];
   }
@@ -478,15 +512,41 @@ function ipInCIDR(ip, cidr) {
   return (ipToNum(ip) & mask) === (ipToNum(base) & mask);
 }
 
-function ipInCIDRList(ip, cidrs) {
-  return cidrs.some(cidr => ipInCIDR(ip, cidr));
+// 把文本 IPv6 展开成 8 组（:: 处补零），再拼成 128 位整数。
+// BigInt 是必需的：IPv6 地址超出 Number 的安全整数范围，用位移会静默丢位。
+function ipv6Groups(ip) {
+  const parts = String(ip).split('::');
+  const head = parts[0] ? parts[0].split(':') : [];
+  const tail = parts.length === 2 ? (parts[1] ? parts[1].split(':') : []) : [];
+  const fill = parts.length === 2 ? 8 - head.length - tail.length : 0;
+  return [...head, ...Array(Math.max(0, fill)).fill('0'), ...tail];
 }
 
-async function fetchCFIPv4CIDRs() {
+function ipv6ToBigInt(ip) {
+  return ipv6Groups(ip).reduce((n, g) => (n << 16n) + BigInt(parseInt(g || '0', 16)), 0n);
+}
+
+function ipInCIDRv6(ip, cidr) {
+  const [base, bits] = cidr.split('/');
+  const prefix = BigInt(parseInt(bits, 10));
+  if (prefix <= 0n) return true;
+  if (prefix >= 128n) return ipv6ToBigInt(ip) === ipv6ToBigInt(base);
+  const mask = ((1n << 128n) - 1n) ^ ((1n << (128n - prefix)) - 1n);
+  return (ipv6ToBigInt(ip) & mask) === (ipv6ToBigInt(base) & mask);
+}
+
+// 按地址本身的形态选匹配方式，调用点不用关心当前扫的是 v4 还是 v6。
+function ipInCIDRList(ip, cidrs) {
+  const match = ip.includes(':') ? ipInCIDRv6 : ipInCIDR;
+  return cidrs.some(cidr => match(ip, cidr));
+}
+
+async function fetchCFCIDRs(ipVersion = 4) {
   try {
     const data = await fetchJSON(CF_IPS_URL);
-    if (data.success && data.result && data.result.ipv4_cidrs) {
-      return data.result.ipv4_cidrs;
+    if (data.success && data.result) {
+      const cidrs = ipVersion === 6 ? data.result.ipv6_cidrs : data.result.ipv4_cidrs;
+      if (cidrs) return cidrs;
     }
   } catch {}
   return null;
@@ -580,13 +640,13 @@ async function checkDomain(domain, sink) {
   const echConfig = await fetchECHConfig();
 
   // 2. DNS resolve
-  const allIPs = await resolveARecords(domain);
+  const allIPs = await resolveRecords(domain);
   if (allIPs.length === 0) {
     throw new AppError('无 A 记录，无法检测');
   }
 
   // 3. Verify IPs belong to Cloudflare
-  const cfCIDRs = await fetchCFIPv4CIDRs();
+  const cfCIDRs = await fetchCFCIDRs();
   let cfIPs = allIPs;
   if (cfCIDRs) {
     cfIPs = allIPs.filter(ip => ipInCIDRList(ip, cfCIDRs));
@@ -690,13 +750,13 @@ async function testDomain(domain, sink) {
   const echConfig = await fetchECHConfig();
 
   // 2. DNS resolve
-  const aIPs = await resolveARecords(domain);
+  const aIPs = await resolveRecords(domain);
   if (aIPs.length === 0) {
     throw new AppError('无 A 记录');
   }
 
   // 3. Verify CF IPs
-  const cfCIDRs = await fetchCFIPv4CIDRs();
+  const cfCIDRs = await fetchCFCIDRs();
   let cfIPs = aIPs;
   if (cfCIDRs) {
     cfIPs = aIPs.filter(ip => ipInCIDRList(ip, cfCIDRs));
@@ -842,12 +902,16 @@ async function testDomain(domain, sink) {
 function parseFlags(argv) {
   const modeIndex = argv.findIndex(a => a === '-c' || a === '-t');
   const modeFlag = modeIndex === -1 ? null : argv[modeIndex];
+  const wantV6 = argv.includes('-6') || argv.includes('--ipv6');
+  const wantV4 = argv.includes('-4') || argv.includes('--ipv4');
   return {
     version: argv.includes('--version') || argv.includes('-v'),
     help: argv.includes('--help') || argv.includes('-h'),
     jsonMode: argv.includes('-json'),
     allMode: argv.includes('-all'),
     noECH: argv.includes('-no-ech') || argv.includes('--no-ech'),
+    ipVersion: wantV6 ? 6 : 4,
+    ipVersionConflict: wantV6 && wantV4,
     serverPort: (() => {
       const i = argv.findIndex(a => a === '-server');
       return i === -1 ? null : (argv[i + 1] && !argv[i + 1].startsWith('-') ? argv[i + 1] : '4837');
@@ -862,10 +926,10 @@ function parseFlags(argv) {
 }
 
 // 把 HTTP query 映射成和 CLI 一致的开关组合。
-// 认得的键: all / json / noech / mode / domain。任何未知键直接报错，
+// 认得的键: all / json / noech / ip / mode / domain。任何未知键直接报错，
 // 避免拼错参数后静默跑成默认扫描。
 function parseQuery(searchParams) {
-  const known = new Set(['all', 'json', 'noech', 'mode', 'domain']);
+  const known = new Set(['all', 'json', 'noech', 'ip', 'mode', 'domain']);
   for (const key of searchParams.keys()) {
     if (!known.has(key)) return { error: `未知参数: ${key}` };
   }
@@ -876,10 +940,16 @@ function parseQuery(searchParams) {
     return raw !== '0' && raw !== 'false';
   };
 
+  const ip = searchParams.get('ip');
+  if (ip !== null && ip !== '4' && ip !== '6') {
+    return { error: `ip 只能是 4 或 6，收到: ${ip}` };
+  }
+
   const flags = {
     allMode: flag('all'),
     jsonMode: flag('json'),
     noECH: flag('noech'),
+    ipVersion: ip === '6' ? 6 : 4,
     mode: null,
     domain: null,
   };
@@ -894,8 +964,8 @@ function parseQuery(searchParams) {
   if (mode !== 'check' && mode !== 'test') {
     return { error: `mode 只能是 check 或 test，收到: ${mode}` };
   }
-  if (flags.allMode || flags.jsonMode || flags.noECH) {
-    return { error: 'mode 与 all / json / noech 不能同时使用' };
+  if (flags.allMode || flags.jsonMode || flags.noECH || flags.ipVersion === 6) {
+    return { error: 'mode 与 all / json / noech / ip=6 不能同时使用' };
   }
   const domain = (searchParams.get('domain') || '').trim();
   if (!domain) return { error: '缺少 domain 参数' };
@@ -942,7 +1012,8 @@ function buildBanner(color) {
 const HELP_TEXT = `cf-ech - 发现指向 Cloudflare CDN 的优质域名
 
 用法:
-  cf-ech              扫描并输出前 20 个实测支持 ECH 的优质域名
+  cf-ech              扫描并输出前 20 个实测支持 ECH 的优质域名（IPv4）
+  cf-ech -6           同上，但按 IPv6（AAAA 记录）实测优选
   cf-ech -no-ech      跳过 ECH 探测，只按普通 TLS 握手筛选优选域名
   cf-ech -all         输出所有实测通过的域名
   cf-ech -json        以 JSON 格式输出
@@ -950,6 +1021,10 @@ const HELP_TEXT = `cf-ech - 发现指向 Cloudflare CDN 的优质域名
   cf-ech -t <domain>  对指定域名的 A 记录 IP 进行 ECH + 无 ECH 双模式 TLS 测速
   cf-ech -server      启动 HTTP 服务（默认端口 4837），参数通过 URL query 传入
   cf-ech --help       显示帮助信息
+
+地址族:
+  默认按 IPv4（A 记录）优选；-6 切换到 IPv6（AAAA 记录），-4 是显式的默认值。
+  -6 仅用于批量扫描，与 -c / -t 不能同时使用。
 
 服务模式:
   cf-ech -server          监听 0.0.0.0:4837
@@ -959,16 +1034,21 @@ const HELP_TEXT = `cf-ech - 发现指向 Cloudflare CDN 的优质域名
   GET /                       用法说明页
   GET /?json=1                批量扫描，JSON 输出
   GET /?all=1&noech=1         全部结果，只做普通 TLS
+  GET /?ip=6                  按 IPv6（AAAA 记录）批量优选
   GET /?mode=check&domain=a.com   等价于 -c a.com
   GET /?mode=test&domain=a.com    等价于 -t a.com`;
 
 async function runBatchScan(flags, sink) {
   const { jsonMode, allMode, noECH } = flags;
+  const ipVersion = flags.ipVersion === 6 ? 6 : 4;
+  const recordLabel = ipVersion === 6 ? 'AAAA' : 'A';
+  // IPv6 放宽到至少 1 个 IP：大量域名的 AAAA 只有一两条，沿用 2 会几乎筛不出结果。
+  const minIPs = ipVersion === 6 ? 1 : 2;
 
   sink.info(buildBanner(sink.color));
   sink.info(noECH
-    ? '正在按普通 TLS 扫描优选 CF 域名列表（已跳过 ECH 探测）...'
-    : '正在扫描实测支持 ECH 的 CF 域名列表...');
+    ? `正在按普通 TLS 扫描优选 CF 域名列表（已跳过 ECH 探测，IPv${ipVersion}）...`
+    : `正在扫描实测支持 ECH 的 CF 域名列表（IPv${ipVersion}）...`);
   sink.info(describeProxy());
   sink.info('');
 
@@ -1012,7 +1092,7 @@ async function runBatchScan(flags, sink) {
   const domainIPs = {};
   let dnsChecked = 0;
   const dnsTasks = domains.map(domain => async () => {
-    const ips = await resolveARecords(domain);
+    const ips = await resolveRecords(domain, ipVersion);
     dnsChecked++;
     if (dnsChecked % 100 === 0 || dnsChecked === domains.length) {
       sink.info(`  进度: ${dnsChecked}/${domains.length}`);
@@ -1020,11 +1100,11 @@ async function runBatchScan(flags, sink) {
     if (ips.length > 0) domainIPs[domain] = ips;
   });
   await runWithPool(dnsTasks, CONCURRENCY);
-  sink.info(`有 A 记录: ${Object.keys(domainIPs).length} 个`);
+  sink.info(`有 ${recordLabel} 记录: ${Object.keys(domainIPs).length} 个`);
 
   // 4. Filter domains with CF IPs
   sink.info('验证 CF IP...');
-  const cfCIDRs = await fetchCFIPv4CIDRs();
+  const cfCIDRs = await fetchCFCIDRs(ipVersion);
   const domainCFIPs = {};
   for (const [domain, ips] of Object.entries(domainIPs)) {
     const cfIPs = cfCIDRs ? ips.filter(ip => ipInCIDRList(ip, cfCIDRs)) : ips;
@@ -1084,7 +1164,7 @@ async function runBatchScan(flags, sink) {
   // 7. Filter 100% success domains, then score
   const domainScores = [];
   for (const [domain, ips] of Object.entries(domainCFIPs)) {
-    const domainScore = buildDomainScore(domain, ips, ipResults);
+    const domainScore = buildDomainScore(domain, ips, ipResults, { minIPs });
     if (domainScore) domainScores.push(domainScore);
   }
 
@@ -1120,9 +1200,10 @@ async function runBatchScan(flags, sink) {
   // 9. Report (stderr)
   sink.info('');
   sink.info(`扫描域名: ${domains.length} | CF 域名: ${Object.keys(domainCFIPs).length} | 100%成功率: ${domainScores.length} | 优选结果: ${outputList.length}`);
-  sink.info(`硬性要求: 所有 IP 的 TLS 握手成功率必须 100%，且至少 2 个 IP`);
+  sink.info(`硬性要求: 所有 IP 的 TLS 握手成功率必须 100%，且至少 ${minIPs} 个 IP`);
   sink.info(`评分维度: 平均延迟(70%) + IP间稳定性(20%) + IP数<=3奖励(10%)`);
   sink.info(`边缘列: colo 是本次实测的 CF 接入点（受本机网络环境影响），非域名固有属性`);
+  sink.info(`地址族: IPv${ipVersion}（${recordLabel} 记录）`);
   sink.info(`ECH: ${noECH ? '已跳过 (-no-ech)' : echConfig ? '已启用' : '未启用(普通TLS)'}`);
 }
 
@@ -1191,9 +1272,18 @@ async function main() {
     return;
   }
 
+  if (flags.ipVersionConflict) {
+    process.stderr.write('-4 与 -6 不能同时使用\n');
+    process.exit(1);
+  }
+
   if (serverPort !== null) {
     if (mode !== null) {
       process.stderr.write('-server 不能与 -c / -t 同时使用\n');
+      process.exit(1);
+    }
+    if (flags.ipVersion === 6) {
+      process.stderr.write('-server 的地址族走 URL query（?ip=6），不接受 -6 参数\n');
       process.exit(1);
     }
     if (Number.isNaN(Number(serverPort)) || Number(serverPort) < 0 || Number(serverPort) > 65535) {
@@ -1205,6 +1295,11 @@ async function main() {
 
   if (noECH && mode !== null) {
     process.stderr.write('-no-ech 仅用于批量扫描；单域名的无 ECH 结果请用: cf-ech -t <domain>\n');
+    process.exit(1);
+  }
+
+  if (flags.ipVersion === 6 && mode !== null) {
+    process.stderr.write('-6 仅用于批量扫描，与 -c / -t 不能同时使用\n');
     process.exit(1);
   }
 
@@ -1246,6 +1341,8 @@ module.exports = {
   evaluateCheckDomain,
   evaluateTestDomain,
   fetchColo,
+  formatIPv6,
+  ipInCIDRv6,
   loadColoCityMap,
   parseFlags,
   parseQuery,

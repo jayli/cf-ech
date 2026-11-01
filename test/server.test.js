@@ -45,7 +45,25 @@ test('parseQuery maps query keys onto the CLI flag shape', () => {
   assert.equal(flags.allMode, true);
   assert.equal(flags.jsonMode, true);
   assert.equal(flags.noECH, true);
+  assert.equal(flags.ipVersion, 4);
   assert.equal(flags.mode, null);
+});
+
+test('parseQuery selects IPv6 with ip=6 and defaults to IPv4', () => {
+  assert.equal(parseQuery(new URLSearchParams('ip=6')).flags.ipVersion, 6);
+  assert.equal(parseQuery(new URLSearchParams('ip=4')).flags.ipVersion, 4);
+  assert.equal(parseQuery(new URLSearchParams('')).flags.ipVersion, 4);
+});
+
+test('parseQuery rejects an ip value that is neither 4 nor 6', () => {
+  assert.match(parseQuery(new URLSearchParams('ip=9')).error, /ip 只能是 4 或 6/);
+});
+
+test('parseQuery rejects ip=6 combined with a single-domain mode', () => {
+  assert.match(
+    parseQuery(new URLSearchParams('mode=check&domain=a.com&ip=6')).error,
+    /不能同时使用/,
+  );
 });
 
 test('parseQuery treats 0 and false as off', () => {

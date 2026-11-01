@@ -13,7 +13,8 @@ npm start                   # 默认批量扫描，输出前 20 个优质域名
 node bin/cf-ech.js          # 等价
 npx cf-ech -all             # 输出所有 100% 成功率域名
 npx cf-ech -json            # JSON 格式输出
-npx cf-ech -no-ech          # 跳过 ECH 探测，只按普通 TLS 握手做 CF 优选（可组合 -all / -json）
+npx cf-ech -no-ech          # 跳过 ECH 探测，只按普通 TLS 握手做 CF 优选（可组合 -all / -json / -6）
+npx cf-ech -6               # 按 IPv6（AAAA 记录）优选；-4 是显式默认值（可组合 -all / -json / -no-ech）
 npx cf-ech -c <domain>      # 单域名检测（每 IP 5 轮 ECH TLS + 延迟/抖动报告）
 npx cf-ech -t <domain>      # 对域名的 A 记录 IP 逐一做 ECH + 无 ECH 双模式 TLS 测速（各 5 轮）
 npx cf-ech -server          # 启动 HTTP 服务（0.0.0.0:4837），参数走 URL query，结果流式返回
@@ -39,11 +40,11 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 
 1. **加载域名** — 读取 `data/domains.txt` + 在线 API (`CF_TOP20_API`) 拉取热门域名，合并去重
 2. **获取 ECH 公钥** — 从 `cloudflare-ech.com` 查询 DoH type 65，提取 SvcParam key=5 的 ECH config（全会话一次，缓存）。`-no-ech` 模式下整步跳过，`echConfig` 保持 `null`
-3. **DNS A 记录** — 对所有域名并发查询 type 1，获取 IP 列表
-4. **CF IP 过滤** — 通过 `api.cloudflare.com/client/v4/ips` 获取 CF IPv4 CIDR，只保留 IP 属 CF 段的域名
+3. **DNS A 记录** — 对所有域名并发查询 type 1，获取 IP 列表；`-6` 时改查 type 28（AAAA），后续流程完全对称
+4. **CF IP 过滤** — 通过 `api.cloudflare.com/client/v4/ips` 获取 CF IPv4 CIDR，只保留 IP 属 CF 段的域名；`-6` 时取同一接口的 `ipv6_cidrs`
 5. **IP 去重** — 所有域名共享同一个 IP→域名映射表，同一 IP 只测一次
 6. **ECH TLS 实测** — 每个唯一 IP 做 2 轮 `tls.connect({ ech: { config } })` 握手，统计成败和延迟；`-no-ech` 模式下换成普通 `testTLS`，流程与门槛不变
-7. **硬性过滤** — 任何握手失败的域名直接排除，只保留 100% 成功率且至少 2 个 IP 的域名
+7. **硬性过滤** — 任何握手失败的域名直接排除，只保留 100% 成功率且至少 2 个 IP 的域名；`-6` 时放宽到至少 1 个（大量域名的 AAAA 只有一两条）
 8. **评分排序** — `score = 平均延迟 × 70 + IP间稳定性 × 20 + IP数可控性 × 10`（所有 IP 平均延迟越低越好、IP 间延迟差越小越好、3 个以内 IP 不扣分），按分降序、平均延迟/离散度/最快 IP 延迟 tiebreak
 9. **探测边缘接入点** — 对所有握手计时完成后，只对最终要输出的域名做 `GET /cdn-cgi/trace`（显式带 `Host` 头，否则 CF 按 IP 路由返回 403），取 `colo` 三字码，缺失时退回 `cf-ray` 头后缀
 10. **输出** — 默认前 20 个，四列对齐（域名 | IP | 延迟 | 边缘）
@@ -53,7 +54,7 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 | 函数 | 用途 |
 |---|---|
 | `fetchECHConfig(domain)` | 从指定域名的 HTTPS 记录提取 ECH 公钥，带缓存 |
-| `resolveARecords(domain)` | 单次 DNS type 1 查询 |
+| `resolveRecords(domain, ipVersion)` | 单次 DNS 查询：v4 查 type 1，v6 查 type 28 |
 | `testECHTLS(ip, timeout, sni, echConfig)` | 带 ECH 配置的 TLS 握手，返回 `{ success, elapsed }` |
 | `testTLS(ip, timeout, sni)` | 普通 TLS 握手，ECH config 获取失败时的 fallback |
 | `checkDomain(domain, sink)` | `-c` 单域名检测：单次 DNS → CF 验证 → 每 IP 5 轮 ECH TLS → 延迟/抖动/评价 |
@@ -71,7 +72,7 @@ npx cf-ech -server 8080 -host 127.0.0.1   # 指定端口 / 只监听本机
 | `ConnectProxyAgent` | `https.Agent` 子类：先 `CONNECT host:port` 建隧道，再在隧道上 `tls.connect` |
 | `attachColos(items, opts)` | 给结果行补 `colo` 字段，同一个 (ip, domain) 只探一次 |
 | `describeColo(colo)` | 展示用标签：`LAX 洛杉矶`，未知时 `未知` |
-| `parseFlags(argv)` | 解析 CLI 参数（`-json` / `-all` / `-no-ech` / `-server` / `-host` / `-c` / `-t` / `-h` / `-v`） |
+| `parseFlags(argv)` | 解析 CLI 参数（`-json` / `-all` / `-no-ech` / `-4` / `-6` / `-server` / `-host` / `-c` / `-t` / `-h` / `-v`） |
 | `parseQuery(searchParams)` | 把 HTTP query 映射成同一组 flags，非法组合返回 `{ error }` |
 | `createServer({ run, parseQuery, isAppError })` | 构建 HTTP 服务，`run` 可注入以便测试 |
 
@@ -94,6 +95,16 @@ Node 的 `https` 不读 macOS 系统代理表（那是 CFNetwork 的配置），
 如果 `cloudflare-ech.com` 的 ECH 公钥获取失败，整个扫描降级为普通 TLS 测试，并 stderr 标注警告。`-c` 模式下同样处理。
 
 `-no-ech` 是主动版本：不请求 ECH 公钥，`echConfig` 直接保持 `null`，批量扫描全程走 `testTLS`。它只对批量模式生效，与 `-c` / `-t` 同时使用会报错退出（单域名的无 ECH 结果用 `-t` 看）。
+
+### 地址族（`-4` / `-6`）
+
+默认 IPv4（A 记录）；`-6` 切到 AAAA 记录，整条批量流程对称复用（DNS、CF 段过滤、去重、握手、评分、colo）。实现约束：
+
+- **IPv6 文本格式必须走 RFC 5952 规范化**（`formatIPv6`）：同一地址有多种写法，不规范会破坏跨域名 IP 去重和输出可读性。
+- **v6 网段匹配用 128 位 BigInt**（`ipInCIDRv6`）：超出 Number 安全整数范围，位移会静默丢位。`ipInCIDRList` 按地址形态自动选 v4/v6 匹配。
+- **入选门槛放宽到 1 个 IP**（`buildDomainScore` 的 `minIPs`）：大量域名 AAAA 只有一两条，沿用 2 会几乎筛不出结果。100% 成功率门槛不变。
+- **TLS/colo 探测对 IPv6 字面量无需特殊处理**：`tls.connect({ host })` / `https.get({ host })` 原生支持 `2606:4700::1` 这类写法。
+- **仅批量模式**：与 `-c` / `-t` 同时使用报错退出，`-4` 与 `-6` 互斥。本机无 IPv6 出口时所有握手超时、结果为空，属预期行为。
 
 ### 边缘接入点（colo）
 
@@ -120,8 +131,8 @@ Node 的 `https` 不读 macOS 系统代理表（那是 CFNetwork 的配置），
 - `GET /?json=1` → 缓冲到结束再返回 `application/json`，避免进度文字污染 JSON
 - 非 GET → 405，未知路径 → 404，未知 query 键或非法组合 → 400 且不执行扫描
 
-query 键：`all` / `json` / `noech`（`0` 和 `false` 视为关）、`mode=check|test` + `domain=`。
-`mode` 与批量开关互斥，规则与 CLI 的 `-no-ech` + `-c/-t` 一致。
+query 键：`all` / `json` / `noech`（`0` 和 `false` 视为关）、`ip=4|6`、`mode=check|test` + `domain=`。
+`mode` 与批量开关互斥（含 `ip=6`），规则与 CLI 的 `-no-ech` + `-c/-t` 一致。
 
 实现要点：
 - **串行排队**：`createLock()` 保证同一时刻只跑一个扫描。并发扫描会互相抢带宽把延迟数字搞脏，而这工具的全部意义就是延迟。排队请求先收到一行「排队结束」再开始。

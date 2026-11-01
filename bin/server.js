@@ -34,6 +34,8 @@ function indexPage(port) {
   const samples = [
     ['/?json=1', '批量扫描，JSON 输出'],
     ['/?all=1', '批量扫描，输出所有通过域名'],
+    ['/?ip=6', '按 IPv6（AAAA 记录）批量优选'],
+    ['/?ip=6&all=1&json=1', 'IPv6 优选，全部结果，JSON 输出'],
     ['/?noech=1', '跳过 ECH 探测，只按普通 TLS 优选'],
     ['/?all=1&noech=1', '普通 TLS 优选，输出全部结果'],
     ['/?mode=check&domain=example.com', '等价于 cf-ech -c example.com'],
@@ -66,6 +68,7 @@ function indexPage(port) {
 </table>
 
 <p class="note">
+默认按 IPv4（A 记录）优选；<code>ip=6</code> 切到 IPv6（AAAA 记录），仅用于批量扫描。<br>
 同一时刻只跑一次扫描，后到的请求排队等待，避免并发互相干扰把延迟数字搞脏。<br>
 扫描过程中先返回过程日志，最后是结果；<code>json=1</code> 例外，它在结束时一次性返回合法 JSON。<br>
 服务默认监听 <code>0.0.0.0</code>，同网段的任何人都能触发扫描；只想本机访问请用 <code>cf-ech -server -host 127.0.0.1</code>。
