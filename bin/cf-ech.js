@@ -21,10 +21,12 @@ const DOH_SERVERS = [
 const CONCURRENCY = 50;
 const SCAN_TIMEOUT = 5000;
 const COLO_TIMEOUT = 5000;
-// -6 开跑前先直连这几个 Cloudflare IPv6 地址探一下出口；全超时说明本机没有可用 IPv6 出网，
-// 与其跑完几百次超时握手再给一个空结果，不如立刻报错停下。测速握手必须直连（不走代理），
-// 所以这里也用裸 TCP 直连，量到的才是本机真实的 IPv6 出网能力。
-const IPV6_EGRESS_TARGETS = ['2606:4700:4700::1111', '2606:4700:4700::1001'];
+// -6 开跑前先探一下 IPv6 出口，不通直接报错，不白跑几百次超时握手。
+// 探测目标必须是工具实测真正会连的那类地址：CF 网站边缘（2606:4700::/32，:443）。
+// 不能用 CF 的 DNS 服务地址（2606:4700:4700::/48）——实测那段 :53/:853 通但 :443 被挡，
+// 拿它当探针会在 v6 明明可用时误报「本机没有 IPv6 出口」。
+// 优先用 cloudflare-ech.com 实时解析出的 AAAA（与扫描同一地址源），解析失败退回内置边缘地址。
+const IPV6_EGRESS_FALLBACK_TARGETS = ['2606:4700::6812:a76', '2606:4700::6812:b76'];
 const IPV6_EGRESS_TIMEOUT = 4000;
 const MAX_RECOMMENDED_LATENCY = 800; // ms — 优选节点的平均延迟上限
 const MAX_RECOMMENDED_JITTER = 1000; // ms — 优选节点的单 IP 抖动上限
@@ -577,9 +579,16 @@ function probeIPv6(ip, port, timeoutMs) {
   });
 }
 
+// 探测目标从 cloudflare-ech.com 的 AAAA 实时解析（和扫描用同一个地址源，
+// 探的就是后面真正要连的那类地址）；解析失败退回内置的 CF 边缘地址。
+async function resolveIPv6EgressTargets({ domain = ECH_PROVIDER, resolve = resolveRecords } = {}) {
+  const ips = await resolve(domain, 6);
+  return ips.length > 0 ? ips : IPV6_EGRESS_FALLBACK_TARGETS;
+}
+
 // 任一目标连通就算有出口（单个 IP 偶发不可达不该误判成全局断网）。
 async function checkIPv6Egress({
-  targets = IPV6_EGRESS_TARGETS,
+  targets = IPV6_EGRESS_FALLBACK_TARGETS,
   port = 443,
   timeoutMs = IPV6_EGRESS_TIMEOUT,
   probe = probeIPv6,
@@ -589,18 +598,22 @@ async function checkIPv6Egress({
 }
 
 // -6 模式的闸门：出口不通就抛 AppError 停下（CLI exit 1 / HTTP 400）。
-async function assertIPv6Egress(ipVersion, sink, { check = checkIPv6Egress } = {}) {
+async function assertIPv6Egress(ipVersion, sink, {
+  resolveTargets = resolveIPv6EgressTargets,
+  check = checkIPv6Egress,
+} = {}) {
   if (ipVersion !== 6) return;
   sink.info('检测本机 IPv6 出口...');
-  if (await check()) {
+  const targets = await resolveTargets();
+  if (await check({ targets })) {
     sink.info('IPv6 出口: 正常');
     return;
   }
   throw new AppError(
     '本机没有可用的 IPv6 出口，无法按 IPv6 优选。\n'
-    + `  直连 ${IPV6_EGRESS_TARGETS.join(' / ')}:443 全部超时。\n`
+    + `  直连 ${targets.join(' / ')}:443 全部超时。\n`
     + '  测速握手是直连的（不走代理），所以代理能翻墙也帮不上这一步。\n'
-    + '  自检: curl -6 https://cloudflare-ech.com/cdn-cgi/trace —— 返回的 ip= 必须是 2xxx: 开头的 IPv6。\n'
+    + `  自检: curl -6 https://${ECH_PROVIDER}/cdn-cgi/trace —— 返回的 ip= 必须是 2xxx: 开头的 IPv6。\n`
     + '  常见原因: 运营商未放行 IPv6 / 光猫或路由的 IPv6 断了 / 被 TUN 抢了默认路由却没有真出口。\n'
     + '  改用 IPv4: cf-ech（去掉 -6）'
   );
@@ -1389,9 +1402,10 @@ if (require.main === module) {
 
 module.exports = {
   AppError,
-  IPV6_EGRESS_TARGETS,
+  IPV6_EGRESS_FALLBACK_TARGETS,
   assertIPv6Egress,
   checkIPv6Egress,
+  resolveIPv6EgressTargets,
   createSink,
   buildDomainScore,
   attachColos,
